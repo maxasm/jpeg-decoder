@@ -136,9 +136,6 @@ func decodeStartOfFrame(h *Header) {
 			}
 		}
 
-		if zeroBased {
-			compId += 1
-		}
 		h.cComponents = append(h.cComponents, ColorComponent{
 			Id:              compId,
 			vSamplingFactor: vSamplingFactor,
@@ -148,6 +145,11 @@ func decodeStartOfFrame(h *Header) {
 	}
 	h.width = width
 	h.height = height
+	if zeroBased {
+		for a := range h.cComponents {
+			h.cComponents[a].Id += 1
+		}
+	}
 	h.print()
 	if length != 0 {
 		fmt.Printf("Error! Invalid Start Of Frame\n")
