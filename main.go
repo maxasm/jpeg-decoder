@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path"
@@ -211,7 +212,6 @@ func decodeDefineHuffmanTable(header *Header) {
 func endScan(header *Header) {
 	buf := header.buffer
 	fmt.Printf("*** EOI (0xFF%X) ***\n", buf.bf[0])
-	header.print()
 }
 
 func decodeStartOfScan(header *Header) {
@@ -368,6 +368,246 @@ func decodeJPEG(filename string) {
 		buffer.advance()
 	}
 	file.Close()
+	//header.print()
+	// After getting all the information from the JPEG File, decode the huffman data and get the MCUs
+	decodeMCUArray(header)
+}
+
+func generateCodes(tb *HuffmanTable) {
+	// Iterate through all the lenghts
+	code := 0
+	lastIndex := 0
+	for a := 0; a < 16; a++ {
+		nCodes := tb.codesOfLen[a]
+		for k := lastIndex; k < lastIndex+nCodes; k++ {
+			tb.codes = append(tb.codes, code)
+			code += 1
+		}
+		code <<= 1
+		lastIndex += nCodes
+	}
+}
+
+func decodeChannelData(br *BitReader, channel *[64]int, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int) {
+	// Decode the DC coeffecient
+	sym := scanSymbol(br, dcHuffmanTable)
+	if sym == 0xFF {
+		fmt.Printf("Error! invalid DC Symbols\n")
+		os.Exit(1)
+	}
+	dcLength := int(sym)
+	// Since for DC length == sym
+	coeff := br.readBits(dcLength)
+	coeff += *prevDC
+	*prevDC = coeff
+	if dcLength != 0 && coeff < (1<<(dcLength-1)) {
+		coeff -= ((1 << dcLength) - 1)
+	}
+	(*channel)[0] = coeff
+	// Decode the AC Coeffecients
+	index := 1
+	for {
+		if index > 63 {
+			break
+		}
+		sym = scanSymbol(br, acHuffmanTable)
+		switch sym {
+		// The remaining coeffecients are all 0
+		case 0x00:
+			for a := index; a <= 63; a++ {
+				(*channel)[zigzag[a]] = 0
+				index++
+			}
+		// The next 16 coeffecients are all 0
+		case 0xF0:
+			max := index + 16
+			for a := index; a < max; a++ {
+				(*channel)[zigzag[a]] = 0
+				index++
+			}
+		// Decode the coeffLength and numZeros
+		default:
+			numZeros := sym >> 4
+			coeffLength := int(sym & 0x0F)
+			max := index + int(numZeros)
+			for a := index; a < max; a++ {
+				(*channel)[zigzag[a]] = 0
+				index++
+			}
+			// read the coeffecient
+			coeff := br.readBits(int(coeffLength))
+			if coeff < (1 << (coeffLength - 1)) {
+				coeff -= ((1 << coeffLength) - 1)
+			}
+			(*channel)[zigzag[index]] = coeff
+			index++
+		}
+	}
+}
+
+func decodeMCUArray(header *Header) {
+	mcuWidth := (header.width + 7) / 8
+	mcuHeight := (header.height + 7) / 8
+	mcuCount := mcuWidth * mcuHeight
+	fmt.Printf("MCU width: %d, height: %d, count: %d\n", mcuWidth, mcuHeight, mcuCount)
+
+	// Generate the codes for every huffman table
+	for t := range header.huffmanTables {
+		tb := &header.huffmanTables[t]
+		generateCodes(tb)
+	}
+
+	// Create the MCU Array
+	MCUArray := []MCU{}
+	MCUArray = make([]MCU, mcuCount)
+
+	// The prevDC values -- incase there is a restart interval > 0
+	prevDC := [3]int{0, 0, 0}
+	// The bitReader used to read the bits
+	btr := &BitReader{
+		data: &header.bitstream,
+	}
+	// Iterate through every MCU
+	for a := 0; a < mcuCount; a++ {
+		// Restart Interval
+		if header.restartInterval != 0 && a%header.restartInterval == 0 {
+			prevDC[0] = 0
+			prevDC[1] = 0
+			prevDC[2] = 0
+			btr.align()
+		}
+		// Get the current MCU by refference
+		cMCU := &MCUArray[a]
+		// Iterate through the 3 channels
+		for c := 0; c < 3; c++ {
+			// Get the correct MCU channel
+			var channel *[64]int
+			// Get the correct AC Huffman Table
+			var acHuffmanTable *HuffmanTable
+			// Get the correct DC Huffman Table
+			var dcHuffmanTable *HuffmanTable
+			switch c {
+			case 0:
+				channel = &cMCU.ch1
+				acHuffmanTable = getTable(header.cComponents[c].acHuffmanTableId, false, header)
+				dcHuffmanTable = getTable(header.cComponents[c].dcHuffmanTableId, true, header)
+			case 1:
+				channel = &cMCU.ch2
+				acHuffmanTable = getTable(header.cComponents[c].acHuffmanTableId, false, header)
+				dcHuffmanTable = getTable(header.cComponents[c].dcHuffmanTableId, true, header)
+
+			case 2:
+				channel = &cMCU.ch3
+				acHuffmanTable = getTable(header.cComponents[c].acHuffmanTableId, false, header)
+				dcHuffmanTable = getTable(header.cComponents[c].dcHuffmanTableId, true, header)
+
+			}
+			// Using the correct channel, acTable and dcTable decode the data
+			decodeChannelData(btr, channel, acHuffmanTable, dcHuffmanTable, &prevDC[c])
+		}
+	}
+
+	m := MCUArray[0]
+	for b := 0; b < 3; b++ {
+		var ch *[64]int
+		switch b {
+		case 0:
+			ch = &m.ch1
+		case 1:
+			ch = &m.ch2
+		case 2:
+			ch = &m.ch3
+		}
+		fmt.Printf("\n\n ----------\n")
+		for a := 0; a < 64; a++ {
+			if a%8 == 0 {
+				fmt.Printf("\n")
+			}
+			fmt.Printf("%d ", ch[a])
+		}
+		fmt.Printf("\n")
+	}
+}
+
+func getTable(tId int, dc bool, header *Header) *HuffmanTable {
+	for t := range header.huffmanTables {
+		tb := &header.huffmanTables[t]
+		if dc == tb.dc && tb.Id == tId {
+			return tb
+		}
+	}
+	return nil
+}
+
+type MCU struct {
+	ch1 [64]int
+	ch2 [64]int
+	ch3 [64]int
+}
+
+type BitReader struct {
+	data     *[]byte
+	nextByte int
+	nextBit  int
+}
+
+func (br *BitReader) align() {
+	if br.nextByte >= len(*br.data) {
+		return
+	}
+	if br.nextBit != 0 {
+		br.nextBit = 0
+		br.nextByte += 1
+	}
+}
+
+// Helper function used to read individual bits
+// reuturns -1 you try reading beyound the []data
+func (br *BitReader) readBit() int {
+	b := 0
+	if br.nextByte >= len(*br.data) {
+		return -1
+	}
+	b = (int((*br.data)[br.nextByte]) >> (7 - br.nextBit)) & 1
+	br.nextBit++
+	if br.nextBit == 8 {
+		br.nextByte++
+		br.nextBit = 0
+	}
+	return int(b)
+}
+
+func (br *BitReader) readBits(c int) int {
+	bits := 0
+	for a := 0; a < c; a++ {
+		bit := br.readBit()
+		if bit == -1 {
+			return -1
+		}
+		bits = (bits << 1) | bit
+	}
+	return bits
+}
+
+func scanSymbol(br *BitReader, ht *HuffmanTable) byte {
+	code := 0
+	lastIndex := 0
+	for a := 0; a < 16; a++ {
+		bit := br.readBit()
+		if bit == -1 {
+			// 0xFF is not a valid symbols and thus can be used to detect errors
+			return 0xFF
+		}
+		code = (code << 1) | bit
+		nCodes := ht.codesOfLen[a]
+		for k := lastIndex; k < lastIndex+nCodes; k++ {
+			if code == ht.codes[k] {
+				return ht.symbols[k]
+			}
+		}
+		lastIndex += nCodes
+	}
+	return 0xFF
 }
 
 func pad(bt byte) string {
@@ -445,6 +685,29 @@ func (header *Header) print() {
 		fmt.Printf("\n")
 	}
 	fmt.Printf("Huffman data length (%d) Bytes\n", len(header.bitstream))
+	fmt.Printf("\n***** Codes *****\n\n")
+	for t := range header.huffmanTables {
+		tb := header.huffmanTables[t]
+		var out bytes.Buffer
+		if tb.dc {
+			out.WriteString("* DC ")
+		} else {
+			out.WriteString("* AC ")
+		}
+		out.WriteString(fmt.Sprintf("Id #%d *\n", tb.Id))
+		lastIndex := 0
+		for a := 0; a < 16; a++ {
+			out.WriteString(fmt.Sprintf("Len #%d\n", a+1))
+			nCodes := tb.codesOfLen[a]
+			for k := lastIndex; k < lastIndex+nCodes; k++ {
+				out.WriteString(fmt.Sprintf("%b\n", tb.codes[k]))
+			}
+			lastIndex += nCodes
+			out.WriteString("\n")
+		}
+		out.WriteString("\n")
+		fmt.Printf(out.String())
+	}
 }
 
 // Markers
@@ -454,7 +717,6 @@ const (
 	SOF1 = 0xC1 // Extended sequential DCT
 	SOF2 = 0xC2 // Progressive DCT
 	SOF3 = 0xC3 // Lossless (sequential)
-
 	// Start of Frame markers, differential, Huffman coding
 	SOF5 = 0xC5 // Differential sequential DCT
 	SOF6 = 0xC6 // Differential progressive DCT
@@ -543,6 +805,7 @@ type QuantizationTable struct {
 
 type HuffmanTable struct {
 	Id         int
+	codes      []int
 	symbols    []byte
 	codesOfLen [16]int
 	dc         bool
