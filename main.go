@@ -398,11 +398,11 @@ func decodeChannelData(br *BitReader, channel *[64]int, acHuffmanTable *HuffmanT
 	dcLength := int(sym)
 	// Since for DC length == sym
 	coeff := br.readBits(dcLength)
-	coeff += *prevDC
-	*prevDC = coeff
 	if dcLength != 0 && coeff < (1<<(dcLength-1)) {
 		coeff -= ((1 << dcLength) - 1)
 	}
+	coeff += *prevDC
+	*prevDC = coeff
 	(*channel)[0] = coeff
 	// Decode the AC Coeffecients
 	index := 1
@@ -486,20 +486,22 @@ func decodeMCUArray(header *Header) {
 			var acHuffmanTable *HuffmanTable
 			// Get the correct DC Huffman Table
 			var dcHuffmanTable *HuffmanTable
+			acHuffmanTableId := header.cComponents[c].acHuffmanTableId
+			dcHuffmanTableId := header.cComponents[c].dcHuffmanTableId
 			switch c {
 			case 0:
 				channel = &cMCU.ch1
-				acHuffmanTable = getTable(header.cComponents[c].acHuffmanTableId, false, header)
-				dcHuffmanTable = getTable(header.cComponents[c].dcHuffmanTableId, true, header)
+				acHuffmanTable = getTable(acHuffmanTableId, false, header)
+				dcHuffmanTable = getTable(dcHuffmanTableId, true, header)
 			case 1:
 				channel = &cMCU.ch2
-				acHuffmanTable = getTable(header.cComponents[c].acHuffmanTableId, false, header)
-				dcHuffmanTable = getTable(header.cComponents[c].dcHuffmanTableId, true, header)
+				acHuffmanTable = getTable(acHuffmanTableId, false, header)
+				dcHuffmanTable = getTable(dcHuffmanTableId, true, header)
 
 			case 2:
 				channel = &cMCU.ch3
-				acHuffmanTable = getTable(header.cComponents[c].acHuffmanTableId, false, header)
-				dcHuffmanTable = getTable(header.cComponents[c].dcHuffmanTableId, true, header)
+				acHuffmanTable = getTable(acHuffmanTableId, false, header)
+				dcHuffmanTable = getTable(dcHuffmanTableId, true, header)
 
 			}
 			// Using the correct channel, acTable and dcTable decode the data
@@ -507,7 +509,7 @@ func decodeMCUArray(header *Header) {
 		}
 	}
 
-	m := MCUArray[0]
+	m := MCUArray[50000]
 	for b := 0; b < 3; b++ {
 		var ch *[64]int
 		switch b {
