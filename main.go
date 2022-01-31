@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 )
 
 type Buffer struct {
@@ -371,6 +372,8 @@ func decodeJPEG(filename string) {
 	//header.print()
 	// After getting all the information from the JPEG File, decode the huffman data and get the MCUs
 	decodeMCUArray(header)
+	// Write the bitmap
+	writeBitMap(header)
 }
 
 func generateCodes(tb *HuffmanTable) {
@@ -385,6 +388,100 @@ func generateCodes(tb *HuffmanTable) {
 		}
 		code <<= 1
 		lastIndex += nCodes
+	}
+}
+
+func writeBitMap(header *Header) {
+	// Calculate the MCU Width and MCU Height
+	mcuWidth := (header.width + 7) / 8
+	//mcuHeight := (header.height + 7) / 8
+	// The number of bytes that you need to add
+	paddingSize := header.width % 4
+	// The total size
+	// 14 -> The first header
+	// 12 -> The second header
+	// the total number of (pixels * 3) bytes (1 byte per pixel)
+	// the total paddding bytes
+	size := 14 + 12 + (header.height * header.width * 3) + (paddingSize * header.height)
+	// Create the file
+	filename := path.Base(header.filename)
+	i := strings.LastIndex(filename, ".")
+	filename = filename[:i]
+	filename += ".bmp"
+	f, err := os.Create(filename)
+	if err != nil {
+		fmt.Printf("Error! %s\n", err.Error())
+		os.Exit(1)
+	}
+	// mcuArray
+	mcuArray := *header.MCUArray
+	// Write 'B' 'M'
+	f.Write([]byte("BM"))  // BM
+	put4Int(uint(size), f) // The size of the file as a 4 byte integer
+	put4Int(uint(0), f)    // 4 zeros as 4 byte integer
+	put4Int(uint(26), f)   // The pixel array offset as a 4 byte integer
+	// The DIB Header
+	put4Int(12, f)                  // The size of the DIB header as a 4 byte integer
+	put2Int(uint(header.width), f)  // The width as a 2 byte integer
+	put2Int(uint(header.height), f) // The height as a 2 byte integer
+	put2Int(uint(1), f)             // The number of planes as 2 bit integer
+	put2Int(uint(24), f)            // The number of bits per pixel as 2 bit integer
+
+	// Write the pixels
+	for y := header.width - 1; y >= 0; y-- {
+		for x := 0; x < header.height; x++ {
+			_mcuX := x % 8
+			_mcuY := y % 8
+			_mcuI := y/8 + mcuWidth*(x/8)
+			// Write the R,G,B Values
+			data := []byte{}
+			data = make([]byte, 3)
+			data[0] = byte(mcuArray[_mcuI].ch3[_mcuX+(8*_mcuY)])
+			data[1] = byte(mcuArray[_mcuI].ch2[_mcuX+(8*_mcuY)])
+			data[2] = byte(mcuArray[_mcuI].ch1[_mcuX+(8*_mcuY)])
+			_, err := f.Write(data)
+			if err != nil {
+				fmt.Printf("Error! %s\n", err.Error())
+				os.Exit(1)
+			}
+		}
+		// After writing the data for a particular row, add the padding bytes
+		padd := []byte{}
+		padd = make([]byte, paddingSize)
+		_, err := f.Write(padd)
+		if err != nil {
+			fmt.Printf("Error! %s\n", err.Error())
+			os.Exit(1)
+		}
+	}
+	f.Close()
+}
+
+// Helper function to write a 4 byte integer in little endian
+func put4Int(a uint, f *os.File) {
+	data := []byte{}
+	data = make([]byte, 4)
+	data[0] = byte((a >> 0) & 0xFF)
+	data[1] = byte((a >> 8) & 0xFF)
+	data[2] = byte((a >> 16) & 0xFF)
+	data[3] = byte((a >> 24) & 0xFF)
+	_, err := f.Write(data)
+	if err != nil {
+		fmt.Printf("Error! %s\n", err.Error())
+		os.Exit(1)
+	}
+}
+
+// Helper function to write a 2 byte integer in little endian
+func put2Int(a uint, f *os.File) {
+	data := []byte{}
+	data = make([]byte, 2)
+	data[0] = byte((a >> 0) & 0xFF)
+	data[1] = byte((a >> 8) & 0xFF)
+	_, err := f.Write(data)
+	if err != nil {
+		fmt.Printf("Error! %s\n", err.Error())
+		os.Exit(1)
 	}
 }
 
@@ -508,27 +605,8 @@ func decodeMCUArray(header *Header) {
 			decodeChannelData(btr, channel, acHuffmanTable, dcHuffmanTable, &prevDC[c])
 		}
 	}
-
-	m := MCUArray[50000]
-	for b := 0; b < 3; b++ {
-		var ch *[64]int
-		switch b {
-		case 0:
-			ch = &m.ch1
-		case 1:
-			ch = &m.ch2
-		case 2:
-			ch = &m.ch3
-		}
-		fmt.Printf("\n\n ----------\n")
-		for a := 0; a < 64; a++ {
-			if a%8 == 0 {
-				fmt.Printf("\n")
-			}
-			fmt.Printf("%d ", ch[a])
-		}
-		fmt.Printf("\n")
-	}
+	// Set header.MCUArray
+	header.MCUArray = &MCUArray
 }
 
 func getTable(tId int, dc bool, header *Header) *HuffmanTable {
@@ -829,6 +907,7 @@ type Header struct {
 	successiveApproximationLow  byte
 	bitstream                   []byte
 	zeroBased                   bool
+	MCUArray                    *[]MCU
 }
 
 type ColorComponent struct {
