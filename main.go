@@ -372,8 +372,46 @@ func decodeJPEG(filename string) {
 	//header.print()
 	// After getting all the information from the JPEG File, decode the huffman data and get the MCUs
 	decodeMCUArray(header)
+	// Dequantize the MCU
+	dequantize(header)
 	// Write the bitmap
 	writeBitMap(header)
+	// Print the header
+	header.print()
+}
+
+func dequantize(header *Header) {
+	for a := range *header.MCUArray {
+		mcu := &(*header.MCUArray)[a]
+		// dequantize all the three channels
+		for c := 0; c < 3; c++ {
+			var ch *[64]int
+			qTableId := header.cComponents[c].qTableId
+			var qTable *QuantizationTable
+			for qt := range header.qTables {
+				tb := &header.qTables[qt]
+				if tb.Id == qTableId {
+					qTable = tb
+				}
+			}
+			switch c {
+			case 0:
+				ch = &mcu.ch1
+			case 1:
+				ch = &mcu.ch2
+			case 2:
+				ch = &mcu.ch3
+			}
+			if ch == nil || qTable == nil {
+				fmt.Printf("Error! ch == nil || qTable == nil\n")
+				os.Exit(1)
+			}
+			// Iterate through the entire channel,dequantizing the coeffecients
+			for k := 0; k < 64; k++ {
+				(*ch)[k] *= int((*qTable).table[k])
+			}
+		}
+	}
 }
 
 func generateCodes(tb *HuffmanTable) {
