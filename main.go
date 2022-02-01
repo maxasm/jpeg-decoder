@@ -449,7 +449,7 @@ func performInverseDCT(header *Header) {
 	}
 }
 
-func inverseDCTPixel(x int, y int, channel *[64]int) float32 {
+func inverseDCTPixel(y int, x int, channel *[64]int) float32 {
 	var sum float32 = 0.0
 	PI := float32(math.Pi)
 
@@ -574,9 +574,9 @@ func writeBitMap(header *Header) {
 			// Write the RGB Values
 			rgb := []byte{}
 			rgb = make([]byte, 3)
-			rgb[0] = byte(mcuArray[_mcuIndex].ch1[_pixelIndex])
+			rgb[0] = byte(mcuArray[_mcuIndex].ch3[_pixelIndex])
 			rgb[1] = byte(mcuArray[_mcuIndex].ch2[_pixelIndex])
-			rgb[2] = byte(mcuArray[_mcuIndex].ch3[_pixelIndex])
+			rgb[2] = byte(mcuArray[_mcuIndex].ch1[_pixelIndex])
 			f.Write(rgb)
 		}
 		// After writing the data for a particular row, add the padding bytes
