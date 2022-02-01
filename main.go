@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"strings"
@@ -99,11 +100,11 @@ func decodeStartOfFrame(h *Header) {
 	buf.advance()
 	buf.advance()
 	length -= 2
-	width := (int(buf.bf[1]) << 8) + int(buf.bf[0])
+	height := (int(buf.bf[1]) << 8) + int(buf.bf[0])
 	buf.advance()
 	buf.advance()
 	length -= 2
-	height := (int(buf.bf[1]) << 8) + int(buf.bf[0])
+	width := (int(buf.bf[1]) << 8) + int(buf.bf[0])
 	buf.advance()
 	length -= 1
 	components := int(buf.bf[0])
@@ -374,10 +375,105 @@ func decodeJPEG(filename string) {
 	decodeMCUArray(header)
 	// Dequantize the MCU
 	dequantize(header)
+	// Inverse DCT
+	performInverseDCT(header)
+	// TCbCr -> RGB
+	YCbCrToRGB(header)
 	// Write the bitmap
 	writeBitMap(header)
 	// Print the header
 	header.print()
+}
+
+func YCbCrToRGB(header *Header) {
+	for m := range *header.MCUArray {
+		mcu := &(*header.MCUArray)[m]
+		for a := 0; a < 64; a++ {
+			y := float32(mcu.ch1[a])
+			cb := float32(mcu.ch2[a])
+			cr := float32(mcu.ch3[a])
+			r := y + (1.402 * cr) + 128
+			g := y - (0.344 * cb) - (0.714 * cr) + 128
+			b := y + (1.772 * cb) + 128
+			if r < 0 {
+				r = 0
+			}
+			if r > 255 {
+				r = 255
+			}
+			if g < 0 {
+				g = 0
+			}
+			if g > 255 {
+				g = 255
+			}
+			if b < 0 {
+				b = 0
+			}
+			if b > 255 {
+				b = 255
+			}
+
+			(*mcu).ch1[a] = int(r)
+			(*mcu).ch2[a] = int(g)
+			(*mcu).ch3[a] = int(b)
+		}
+	}
+}
+
+func performInverseDCT(header *Header) {
+	for m := range *header.MCUArray {
+		mcu := &(*header.MCUArray)[m]
+		for c := 0; c < 3; c++ {
+			// Create a new array to store the new values
+			newChannel := [64]int{}
+			var channel *[64]int
+			switch c {
+			case 0:
+				channel = &mcu.ch1
+			case 1:
+				channel = &mcu.ch2
+			case 2:
+				channel = &mcu.ch3
+			}
+			// Get the (x,y) cordinates
+			for y := 0; y < 8; y++ {
+				for x := 0; x < 8; x++ {
+					c := inverseDCTPixel(x, y, channel)
+					newChannel[x+8*y] = int(c)
+				}
+			}
+			// After you are done with all the pixels, set the new values of the channel
+			(*channel) = newChannel
+		}
+	}
+}
+
+func inverseDCTPixel(x int, y int, channel *[64]int) float32 {
+	var sum float32 = 0.0
+	PI := float32(math.Pi)
+
+	for u := 0; u < 8; u++ {
+		for v := 0; v < 8; v++ {
+			coeff := float32((*channel)[u+8*v])
+			cos1 := math.Cos(float64(((2*float32(x) + 1) * float32(u) * PI) / 16))
+			cos2 := math.Cos(float64(((2*float32(y) + 1) * float32(v) * PI) / 16))
+			if u == 0 {
+				if v == 0 {
+					sum += 0.5 * coeff * float32(cos1) * float32(cos2)
+				} else {
+					sum += (1 / float32(math.Sqrt(2))) * coeff * float32(cos1) * float32(cos2)
+				}
+			} else {
+				if v != 0 {
+					sum += coeff * float32(cos1) * float32(cos2)
+				} else {
+					sum += (1 / float32(math.Sqrt(2))) * coeff * float32(cos1) * float32(cos2)
+				}
+			}
+		}
+	}
+	return sum / 4
 }
 
 func dequantize(header *Header) {
@@ -392,6 +488,7 @@ func dequantize(header *Header) {
 				tb := &header.qTables[qt]
 				if tb.Id == qTableId {
 					qTable = tb
+					break
 				}
 			}
 			switch c {
@@ -460,32 +557,34 @@ func writeBitMap(header *Header) {
 	put4Int(uint(26), f)   // The pixel array offset as a 4 byte integer
 	// The DIB Header
 	put4Int(12, f)                  // The size of the DIB header as a 4 byte integer
-	put2Int(uint(header.width), f)  // The width as a 2 byte integer
-	put2Int(uint(header.height), f) // The height as a 2 byte integer
+	put2Int(uint(header.width), f)  // The height as a 2 byte integer
+	put2Int(uint(header.height), f) // The width as a 2 byte integer
 	put2Int(uint(1), f)             // The number of planes as 2 bit integer
 	put2Int(uint(24), f)            // The number of bits per pixel as 2 bit integer
 
 	// Write the pixels
-	for y := header.width - 1; y >= 0; y-- {
-		for x := 0; x < header.height; x++ {
+	for y := header.height - 1; y >= 0; y-- {
+		_mcuY := y % 8   // pixel row
+		_mcuRow := y / 8 // The MCU Row
+		for x := 0; x < header.width; x++ {
 			_mcuX := x % 8
-			_mcuY := y % 8
-			_mcuI := y/8 + mcuWidth*(x/8)
-			// Write the R,G,B Values
-			data := []byte{}
-			data = make([]byte, 3)
-			data[0] = byte(mcuArray[_mcuI].ch3[_mcuX+(8*_mcuY)])
-			data[1] = byte(mcuArray[_mcuI].ch2[_mcuX+(8*_mcuY)])
-			data[2] = byte(mcuArray[_mcuI].ch1[_mcuX+(8*_mcuY)])
-			_, err := f.Write(data)
-			if err != nil {
-				fmt.Printf("Error! %s\n", err.Error())
-				os.Exit(1)
-			}
+			_mcuColumn := x / 8
+			_mcuIndex := _mcuColumn + (mcuWidth * _mcuRow)
+			_pixelIndex := _mcuY + (8 * _mcuX)
+			// Write the RGB Values
+			rgb := []byte{}
+			rgb = make([]byte, 3)
+			rgb[0] = byte(mcuArray[_mcuIndex].ch1[_pixelIndex])
+			rgb[1] = byte(mcuArray[_mcuIndex].ch2[_pixelIndex])
+			rgb[2] = byte(mcuArray[_mcuIndex].ch3[_pixelIndex])
+			f.Write(rgb)
 		}
 		// After writing the data for a particular row, add the padding bytes
 		padd := []byte{}
 		padd = make([]byte, paddingSize)
+		for k := range padd {
+			padd[k] = 0x00
+		}
 		_, err := f.Write(padd)
 		if err != nil {
 			fmt.Printf("Error! %s\n", err.Error())
