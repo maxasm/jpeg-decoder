@@ -1,12 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"math"
 	"os"
 	"path"
-	"strings"
 )
 
 type Buffer struct {
@@ -112,6 +109,10 @@ func decodeStartOfFrame(h *Header) {
 		fmt.Printf("Error! Number of components > 3. CMYK ColorMode not supported\n")
 		os.Exit(1)
 	}
+	// Set the width and the height
+	h.width = width
+	h.height = height
+
 	for a := 0; a < components; a++ {
 		buf.advance()
 		length -= 1
@@ -143,16 +144,200 @@ func decodeStartOfFrame(h *Header) {
 			hSamplingFactor: hSamplingFactor,
 			qTableId:        qTableId,
 		})
+
 	}
-	h.width = width
-	h.height = height
 	if h.zeroBased {
 		for a := range h.cComponents {
 			h.cComponents[a].Id += 1
 		}
 	}
+
+	comp := h.cComponents[0]
+	// Check the scling factor of the Y channel and set the mcuWidth and Height
+	if comp.hSamplingFactor == 1 {
+		if comp.vSamplingFactor == 1 {
+			h.mcuDimensions = _8x8
+			h.mcuWidth = (h.width + 7) / 8
+			h.mcuHeight = (h.height + 7) / 8
+		} else if comp.vSamplingFactor == 2 {
+			h.mcuDimensions = _8x16
+			h.mcuWidth = (h.width + 7) / 8
+			h.mcuHeight = (h.height + 15) / 16
+		} else {
+			fmt.Printf("Error! Invalid Sampling Factor\n")
+		}
+	} else if comp.hSamplingFactor == 2 {
+		if comp.vSamplingFactor == 1 {
+			h.mcuDimensions = _8x16
+			h.mcuWidth = (h.width + 15) / 16
+			h.mcuHeight = (h.height + 7) / 8
+		} else if comp.vSamplingFactor == 2 {
+			h.mcuDimensions = _16x16
+			h.mcuHeight = (h.height + 15) / 16
+			h.mcuWidth = (h.width + 15) / 16
+		} else {
+			fmt.Printf("Error! invalid Sampling Factor\n")
+		}
+	} else {
+		fmt.Printf("Error! invalid Sampling Factor\n")
+	}
+	h.mcuCount = h.mcuWidth * h.mcuHeight
+	// Check if len == 0
 	if length != 0 {
 		fmt.Printf("Error! Invalid Start Of Frame\n")
+	}
+
+}
+
+func read64Coeffecients(br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int) *[64]int {
+	res := [64]int{}
+	// Read the DC Coeffecient
+	sym := scanSymbol(br, dcHuffmanTable)
+	dcLength := int(sym)
+	// Since the length == 0
+	dcCoeffecient := br.readBits(dcLength)
+	if dcLength != 0 && dcCoeffecient < (1<<(dcLength-1)) {
+		dcCoeffecient -= (1<<dcLength - 1)
+	}
+	dcCoeffecient += *prevDC
+	*prevDC = dcCoeffecient
+	res[0] = dcCoeffecient
+	// Read the remaining 63 AC Coeffecients
+	index := 1
+	for {
+		if index > 63 {
+			break
+		}
+		sym := scanSymbol(br, acHuffmanTable)
+		switch sym {
+		case 0x00:
+			// 0x00 means the remaining coeffecients are all 0
+			for a := index; a <= 63; a++ {
+				res[a] = 0
+				index++
+			}
+			continue
+		case 0xF0:
+			// 0x0F means the next 16 coeffecients are 0
+			max := index + 16
+			for a := index; a < max; a++ {
+				res[a] = 0
+				index++
+			}
+			continue
+		default:
+			numZeros := int(sym >> 4)
+			acLength := int(sym & 0x0F)
+			max := index + numZeros
+			for a := index; a < max; a++ {
+				res[a] = 0
+				index++
+			}
+			acCoeffecient := br.readBits(acLength)
+			if acCoeffecient < (1 << (acLength - 1)) {
+				acCoeffecient -= (1<<acLength - 1)
+			}
+			res[index] = acCoeffecient
+			index++
+		}
+	}
+	return &res
+}
+
+// Helper function to get the correct *HuffmanTable
+func getTable(header *Header, dc bool, Id int) *HuffmanTable {
+	for t := range header.huffmanTables {
+		tab := header.huffmanTables[t]
+		if Id == tab.Id && dc == tab.dc {
+			return &tab
+		}
+	}
+	return nil
+}
+
+// TODO: Store the retured 8*8 block to the right MCU
+func decodeMCUCoeffecients(header *Header) {
+	br := BitReader{data: &header.bitstream}
+	prevDC := 10
+	for a := 0; a < header.mcuCount; a++ {
+		switch header.mcuDimensions {
+		case _8x8:
+			for c := 0; c < 3; c++ {
+				comp := header.cComponents[c]
+				acHuffmanTable := getTable(header, false, comp.acHuffmanTableId)
+				dcHuffmanTable := getTable(header, true, comp.dcHuffmanTableId)
+				read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC)
+			}
+		case _16x8:
+			for c := 0; c < 4; c++ {
+				// Y(0) Y(1) Cb Cr
+				var acHuffmanTable *HuffmanTable
+				var dcHuffmanTable *HuffmanTable
+				switch c {
+				case 0:
+					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[0].acHuffmanTableId)
+				case 1:
+					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[0].acHuffmanTableId)
+				case 2:
+					acHuffmanTable = getTable(header, false, header.cComponents[1].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[1].acHuffmanTableId)
+				case 3:
+					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[2].acHuffmanTableId)
+				}
+				read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC)
+			}
+		case _8x16:
+			for c := 0; c < 4; c++ {
+				// Y(0) Y(1) Cb Cr
+				var acHuffmanTable *HuffmanTable
+				var dcHuffmanTable *HuffmanTable
+				switch c {
+				case 0:
+					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[0].acHuffmanTableId)
+				case 1:
+					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[0].acHuffmanTableId)
+				case 2:
+					acHuffmanTable = getTable(header, false, header.cComponents[1].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[1].acHuffmanTableId)
+				case 3:
+					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[2].acHuffmanTableId)
+				}
+				read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC)
+			}
+		case _16x16:
+			for c := 0; c < 6; c++ {
+				// Y(0) Y(1) Y(2) Y(3) Cb Cr
+				var acHuffmanTable *HuffmanTable
+				var dcHuffmanTable *HuffmanTable
+				switch c {
+				case 0:
+					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[0].acHuffmanTableId)
+				case 1:
+					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[0].acHuffmanTableId)
+				case 2:
+					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[0].acHuffmanTableId)
+				case 3:
+					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[0].acHuffmanTableId)
+				case 4:
+					acHuffmanTable = getTable(header, false, header.cComponents[1].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[1].acHuffmanTableId)
+				case 5:
+					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
+					dcHuffmanTable = getTable(header, true, header.cComponents[2].acHuffmanTableId)
+				}
+				read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC)
+			}
+		}
 	}
 }
 
@@ -370,145 +555,13 @@ func decodeJPEG(filename string) {
 		buffer.advance()
 	}
 	file.Close()
-	//header.print()
-	// After getting all the information from the JPEG File, decode the huffman data and get the MCUs
-	decodeMCUArray(header)
-	// Dequantize the MCU
-	dequantize(header)
-	// Inverse DCT
-	performInverseDCT(header)
-	// TCbCr -> RGB
-	YCbCrToRGB(header)
-	// Write the bitmap
-	writeBitMap(header)
-	// Print the header
-	header.print()
-}
-
-func YCbCrToRGB(header *Header) {
-	for m := range *header.MCUArray {
-		mcu := &(*header.MCUArray)[m]
-		for a := 0; a < 64; a++ {
-			y := float32(mcu.ch1[a])
-			cb := float32(mcu.ch2[a])
-			cr := float32(mcu.ch3[a])
-			r := y + (1.402 * cr) + 128
-			g := y - (0.344 * cb) - (0.714 * cr) + 128
-			b := y + (1.772 * cb) + 128
-			if r < 0 {
-				r = 0
-			}
-			if r > 255 {
-				r = 255
-			}
-			if g < 0 {
-				g = 0
-			}
-			if g > 255 {
-				g = 255
-			}
-			if b < 0 {
-				b = 0
-			}
-			if b > 255 {
-				b = 255
-			}
-
-			(*mcu).ch1[a] = int(r)
-			(*mcu).ch2[a] = int(g)
-			(*mcu).ch3[a] = int(b)
-		}
+	// Decode Codes for every huffanTable
+	for t := range header.huffmanTables {
+		tb := &header.huffmanTables[t]
+		generateCodes(tb)
 	}
-}
-
-func performInverseDCT(header *Header) {
-	for m := range *header.MCUArray {
-		mcu := &(*header.MCUArray)[m]
-		for c := 0; c < 3; c++ {
-			// Create a new array to store the new values
-			newChannel := [64]int{}
-			var channel *[64]int
-			switch c {
-			case 0:
-				channel = &mcu.ch1
-			case 1:
-				channel = &mcu.ch2
-			case 2:
-				channel = &mcu.ch3
-			}
-			// Get the (x,y) cordinates
-			for y := 0; y < 8; y++ {
-				for x := 0; x < 8; x++ {
-					c := inverseDCTPixel(x, y, channel)
-					newChannel[x+8*y] = int(c)
-				}
-			}
-			// After you are done with all the pixels, set the new values of the channel
-			(*channel) = newChannel
-		}
-	}
-}
-
-func inverseDCTPixel(y int, x int, channel *[64]int) float32 {
-	var sum float32 = 0.0
-	PI := float32(math.Pi)
-
-	for u := 0; u < 8; u++ {
-		for v := 0; v < 8; v++ {
-			coeff := float32((*channel)[u+8*v])
-			cos1 := math.Cos(float64(((2*float32(x) + 1) * float32(u) * PI) / 16))
-			cos2 := math.Cos(float64(((2*float32(y) + 1) * float32(v) * PI) / 16))
-			if u == 0 {
-				if v == 0 {
-					sum += 0.5 * coeff * float32(cos1) * float32(cos2)
-				} else {
-					sum += (1 / float32(math.Sqrt(2))) * coeff * float32(cos1) * float32(cos2)
-				}
-			} else {
-				if v != 0 {
-					sum += coeff * float32(cos1) * float32(cos2)
-				} else {
-					sum += (1 / float32(math.Sqrt(2))) * coeff * float32(cos1) * float32(cos2)
-				}
-			}
-		}
-	}
-	return sum / 4
-}
-
-func dequantize(header *Header) {
-	for a := range *header.MCUArray {
-		mcu := &(*header.MCUArray)[a]
-		// dequantize all the three channels
-		for c := 0; c < 3; c++ {
-			var ch *[64]int
-			qTableId := header.cComponents[c].qTableId
-			var qTable *QuantizationTable
-			for qt := range header.qTables {
-				tb := &header.qTables[qt]
-				if tb.Id == qTableId {
-					qTable = tb
-					break
-				}
-			}
-			switch c {
-			case 0:
-				ch = &mcu.ch1
-			case 1:
-				ch = &mcu.ch2
-			case 2:
-				ch = &mcu.ch3
-			}
-			if ch == nil || qTable == nil {
-				fmt.Printf("Error! ch == nil || qTable == nil\n")
-				os.Exit(1)
-			}
-			// Iterate through the entire channel,dequantizing the coeffecients
-			for k := 0; k < 64; k++ {
-				(*ch)[k] *= int((*qTable).table[k])
-			}
-		}
-	}
+	// Decode the MCU Coeffecients
+	decodeMCUCoeffecients(header)
 }
 
 func generateCodes(tb *HuffmanTable) {
@@ -526,6 +579,7 @@ func generateCodes(tb *HuffmanTable) {
 	}
 }
 
+/**
 func writeBitMap(header *Header) {
 	// Calculate the MCU Width and MCU Height
 	mcuWidth := (header.width + 7) / 8
@@ -593,7 +647,7 @@ func writeBitMap(header *Header) {
 	}
 	f.Close()
 }
-
+**/
 // Helper function to write a 4 byte integer in little endian
 func put4Int(a uint, f *os.File) {
 	data := []byte{}
@@ -679,87 +733,11 @@ func decodeChannelData(br *BitReader, channel *[64]int, acHuffmanTable *HuffmanT
 	}
 }
 
-func decodeMCUArray(header *Header) {
-	mcuWidth := (header.width + 7) / 8
-	mcuHeight := (header.height + 7) / 8
-	mcuCount := mcuWidth * mcuHeight
-	fmt.Printf("MCU width: %d, height: %d, count: %d\n", mcuWidth, mcuHeight, mcuCount)
-
-	// Generate the codes for every huffman table
-	for t := range header.huffmanTables {
-		tb := &header.huffmanTables[t]
-		generateCodes(tb)
-	}
-
-	// Create the MCU Array
-	MCUArray := []MCU{}
-	MCUArray = make([]MCU, mcuCount)
-
-	// The prevDC values -- incase there is a restart interval > 0
-	prevDC := [3]int{0, 0, 0}
-	// The bitReader used to read the bits
-	btr := &BitReader{
-		data: &header.bitstream,
-	}
-	// Iterate through every MCU
-	for a := 0; a < mcuCount; a++ {
-		// Restart Interval
-		if header.restartInterval != 0 && a%header.restartInterval == 0 {
-			prevDC[0] = 0
-			prevDC[1] = 0
-			prevDC[2] = 0
-			btr.align()
-		}
-		// Get the current MCU by refference
-		cMCU := &MCUArray[a]
-		// Iterate through the 3 channels
-		for c := 0; c < 3; c++ {
-			// Get the correct MCU channel
-			var channel *[64]int
-			// Get the correct AC Huffman Table
-			var acHuffmanTable *HuffmanTable
-			// Get the correct DC Huffman Table
-			var dcHuffmanTable *HuffmanTable
-			acHuffmanTableId := header.cComponents[c].acHuffmanTableId
-			dcHuffmanTableId := header.cComponents[c].dcHuffmanTableId
-			switch c {
-			case 0:
-				channel = &cMCU.ch1
-				acHuffmanTable = getTable(acHuffmanTableId, false, header)
-				dcHuffmanTable = getTable(dcHuffmanTableId, true, header)
-			case 1:
-				channel = &cMCU.ch2
-				acHuffmanTable = getTable(acHuffmanTableId, false, header)
-				dcHuffmanTable = getTable(dcHuffmanTableId, true, header)
-
-			case 2:
-				channel = &cMCU.ch3
-				acHuffmanTable = getTable(acHuffmanTableId, false, header)
-				dcHuffmanTable = getTable(dcHuffmanTableId, true, header)
-
-			}
-			// Using the correct channel, acTable and dcTable decode the data
-			decodeChannelData(btr, channel, acHuffmanTable, dcHuffmanTable, &prevDC[c])
-		}
-	}
-	// Set header.MCUArray
-	header.MCUArray = &MCUArray
-}
-
-func getTable(tId int, dc bool, header *Header) *HuffmanTable {
-	for t := range header.huffmanTables {
-		tb := &header.huffmanTables[t]
-		if dc == tb.dc && tb.Id == tId {
-			return tb
-		}
-	}
-	return nil
-}
-
+// An MCU is a 1d array whose size depends on the scaling factor
 type MCU struct {
-	ch1 [64]int
-	ch2 [64]int
-	ch3 [64]int
+	ch1 []int
+	ch2 []int
+	ch3 []int
 }
 
 type BitReader struct {
@@ -902,6 +880,9 @@ func (header *Header) print() {
 		fmt.Printf("\n")
 	}
 	fmt.Printf("Huffman data length (%d) Bytes\n", len(header.bitstream))
+
+	fmt.Printf("** MCU --> width: (%d) height: (%d) count:(%d)\n", header.mcuWidth, header.mcuHeight, header.mcuCount)
+	/**
 	fmt.Printf("\n***** Codes *****\n\n")
 	for t := range header.huffmanTables {
 		tb := header.huffmanTables[t]
@@ -925,6 +906,7 @@ func (header *Header) print() {
 		out.WriteString("\n")
 		fmt.Printf(out.String())
 	}
+	**/
 }
 
 // Markers
@@ -1028,6 +1010,15 @@ type HuffmanTable struct {
 	dc         bool
 }
 
+// The mcu dimensions
+const (
+	_ = iota
+	_8x8
+	_8x16
+	_16x8
+	_16x16
+)
+
 type Header struct {
 	filename                    string
 	filesize                    uint
@@ -1045,6 +1036,10 @@ type Header struct {
 	bitstream                   []byte
 	zeroBased                   bool
 	MCUArray                    *[]MCU
+	mcuWidth                    int
+	mcuHeight                   int
+	mcuDimensions               int
+	mcuCount                    int
 }
 
 type ColorComponent struct {
