@@ -1,6 +1,7 @@
 package main
 
 import (
+	"dec/zmap"
 	"fmt"
 	"os"
 	"path"
@@ -168,7 +169,7 @@ func decodeStartOfFrame(h *Header) {
 		}
 	} else if comp.hSamplingFactor == 2 {
 		if comp.vSamplingFactor == 1 {
-			h.mcuDimensions = _8x16
+			h.mcuDimensions = _16x8
 			h.mcuWidth = (h.width + 15) / 16
 			h.mcuHeight = (h.height + 7) / 8
 		} else if comp.vSamplingFactor == 2 {
@@ -255,12 +256,140 @@ func getTable(header *Header, dc bool, Id int) *HuffmanTable {
 	return nil
 }
 
-// TODO: Store the retured 8*8 block to the right MCU
+// Helper function to get the correct quantization table
+func getQuantizationTable(header *Header, tId int) *QuantizationTable {
+	for a := range header.qTables {
+		t := header.qTables[a]
+		if t.Id == tId {
+			return &t
+		}
+	}
+	return nil
+}
+
+func dequantize(header *Header) {
+	for a := 0; a < header.mcuCount; a++ {
+		mcu := &(header.MCUArray)[a]
+		switch header.mcuDimensions {
+		case _8x8:
+			tb := (*getQuantizationTable(header, 0)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch1[k] *= int(tb[k])
+			}
+			tb = (*getQuantizationTable(header, 1)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch2[k] *= int(tb[k])
+			}
+			tb = (*getQuantizationTable(header, 2)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch3[k] *= int(tb[k])
+			}
+		case _16x8:
+			// Y1
+			tb := (*getQuantizationTable(header, 0)).table
+			index := 0
+			for k := 0; k < 8; k++ {
+				base := 16 * k
+				for j := base; j < base+8; j++ {
+					(*mcu).ch1[j] *= int(tb[index])
+					index++
+				}
+			}
+			// Y2
+			index = 0
+			for k := 0; k < 8; k++ {
+				base := 16*k + 8
+				for j := base; j < base+8; j++ {
+					(*mcu).ch1[j] *= int(tb[index])
+					index++
+				}
+			}
+			// Cb
+			tb = (*getQuantizationTable(header, 1)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch2[k] *= int(tb[k])
+			}
+			// Cr
+			tb = (*getQuantizationTable(header, 2)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch3[k] *= int(tb[k])
+			}
+		case _8x16:
+			// Y1
+			tb := (*getQuantizationTable(header, 0)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch1[k] *= int(tb[k])
+			}
+			// Y2
+			for k := 64; k < 128; k++ {
+				(*mcu).ch1[k] *= int(tb[k-64])
+			}
+			// Cb
+			tb = (*getQuantizationTable(header, 1)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch2[k] *= int(tb[k])
+			}
+			// Cr
+			tb = (*getQuantizationTable(header, 2)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch3[k] *= int(tb[k])
+			}
+		case _16x16:
+			// Y1
+			tb := (*getQuantizationTable(header, 0)).table
+			index := 0
+			for k := 0; k < 8; k++ {
+				base := 16 * k
+				for j := base; j < base+8; j++ {
+					(*mcu).ch1[j] *= int(tb[index])
+					index++
+				}
+			}
+			// Y2
+			index = 0
+			for k := 0; k < 8; k++ {
+				base := 16*k + 8
+				for j := base; j < base+8; j++ {
+					(*mcu).ch1[j] *= int(tb[index])
+					index++
+				}
+			}
+			// Y3
+			index = 0
+			for k := 8; k < 16; k++ {
+				base := 16 * k
+				for j := base; j < base+8; j++ {
+					(*mcu).ch1[j] *= int(tb[index])
+					index++
+				}
+			}
+			// Y4
+			index = 0
+			for k := 8; k < 16; k++ {
+				base := 16*k + 8
+				for j := base; j < base+8; j++ {
+					(*mcu).ch1[j] *= int(tb[index])
+					index++
+				}
+			}
+			// Cb
+			tb = (*getQuantizationTable(header, 1)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch2[k] *= int(tb[k])
+			}
+			// Cr
+			tb = (*getQuantizationTable(header, 2)).table
+			for k := 0; k < 64; k++ {
+				(*mcu).ch3[k] *= int(tb[k])
+			}
+		}
+	}
+}
+
 func decodeMCUCoeffecients(header *Header) {
 	// Initialize the MCUArray
-	header.MCUArray = make([]MCU, 0)
 	br := BitReader{data: &header.bitstream}
-	prevDC := 10
+	prevDC := [3]int{0, 0, 0}
 	for a := 0; a < header.mcuCount; a++ {
 		// Get a new MCU Object with the correct dimensions
 		mcu := getMCU(header)
@@ -270,21 +399,21 @@ func decodeMCUCoeffecients(header *Header) {
 				comp := header.cComponents[c]
 				acHuffmanTable := getTable(header, false, comp.acHuffmanTableId)
 				dcHuffmanTable := getTable(header, true, comp.dcHuffmanTableId)
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC)
+				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[0])
 				switch c {
 				case 0:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch1[k] = coeff[zigzag[k]]
+						(*mcu).ch1[zmap.Map1[k]] = coeff[k]
 					}
 
 				case 1:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch2[k] = coeff[zigzag[k]]
+						(*mcu).ch2[zmap.Map1[k]] = coeff[k]
 					}
 
 				case 2:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch3[k] = coeff[zigzag[k]]
+						(*mcu).ch3[zmap.Map1[k]] = coeff[k]
 					}
 				}
 			}
@@ -307,32 +436,24 @@ func decodeMCUCoeffecients(header *Header) {
 					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
 					dcHuffmanTable = getTable(header, true, header.cComponents[2].acHuffmanTableId)
 				}
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC)
+				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[0])
+
 				switch c {
 				case 0:
-					index := 0
-					for k := 0; k < 8; k++ {
-						base := 16 * k
-						for j := base; j < base+8; j++ {
-							(*mcu).ch1[j] = coeff[zigzag[index]]
-							index++
-						}
+					for k := 0; k < 64; k++ {
+						(*mcu).ch1[zmap.Map2[k]] = coeff[k]
 					}
 				case 1:
-					index := 0
-					for k := 0; k < 8; k++ {
-						base := 16*k + 8
-						for j := base; j < base+8; j++ {
-							(*mcu).ch1[j] = coeff[zigzag[index]]
-						}
+					for k := 0; k < 64; k++ {
+						(*mcu).ch1[zmap.Map2[k]+8] = coeff[k]
 					}
 				case 2:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch2[k] = coeff[zigzag[k]]
+						(*mcu).ch2[zmap.Map1[k]] = coeff[k]
 					}
 				case 3:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch3[k] = coeff[zigzag[k]]
+						(*mcu).ch3[zmap.Map1[k]] = coeff[k]
 					}
 				}
 			}
@@ -355,27 +476,26 @@ func decodeMCUCoeffecients(header *Header) {
 					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
 					dcHuffmanTable = getTable(header, true, header.cComponents[2].acHuffmanTableId)
 				}
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC)
+				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[0])
 				switch c {
 				case 0:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch1[k] = coeff[zigzag[k]]
+						(*mcu).ch1[zmap.Map1[k]] = coeff[k]
 					}
 				case 1:
-					for k := 64; k < 128; k++ {
-						(*mcu).ch1[k] = coeff[zigzag[k-64]]
+					for k := 0; k < 64; k++ {
+						(*mcu).ch1[zmap.Map1[k]+64] = coeff[k]
 					}
 				case 2:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch2[k] = coeff[zigzag[k]]
+						(*mcu).ch2[zmap.Map1[k]] = coeff[k]
 					}
 				case 3:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch3[k] = coeff[zigzag[k]]
+						(*mcu).ch3[zmap.Map1[k]] = coeff[k]
 					}
 				}
 			}
-
 		case _16x16:
 			for c := 0; c < 6; c++ {
 				// Y(0) Y(1) Y(2) Y(3) Cb Cr
@@ -401,55 +521,41 @@ func decodeMCUCoeffecients(header *Header) {
 					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
 					dcHuffmanTable = getTable(header, true, header.cComponents[2].acHuffmanTableId)
 				}
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC)
+				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[0])
+				if a == 10 {
+					if c == 0 || c == 1 || c == 2 || c == 3 {
+						fmt.Printf("%v\n", coeff)
+					}
+				}
 				switch c {
 				case 0:
-					index := 0
-					for k := 0; k < 8; k++ {
-						base := 16 * k
-						for j := base; j < base+8; j++ {
-							(*mcu).ch1[j] = coeff[zigzag[index]]
-							index++
-						}
+					for k := 0; k < 64; k++ {
+						(*mcu).ch1[zmap.Map2[k]] = coeff[k]
 					}
 				case 1:
-					index := 0
-					for k := 0; k < 8; k++ {
-						base := 16*k + 8
-						for j := base; j < base+8; j++ {
-							(*mcu).ch1[j] = coeff[zigzag[index]]
-							index++
-						}
+					for k := 0; k < 64; k++ {
+						(*mcu).ch1[zmap.Map2[k]+8] = coeff[k]
 					}
 				case 2:
-					index := 0
-					for k := 8; k < 16; k++ {
-						base := 16 * k
-						for j := base; j < base+8; j++ {
-							(*mcu).ch1[j] = coeff[zigzag[index]]
-							index++
-						}
+					for k := 0; k < 64; k++ {
+						(*mcu).ch1[zmap.Map2[k]+128] = coeff[k]
 					}
 				case 3:
-					index := 0
-					for k := 8; k < 16; k++ {
-						base := 16*k + 8
-						for j := base; j < base+8; j++ {
-							(*mcu).ch1[j] = coeff[zigzag[index]]
-							index++
-						}
+					for k := 0; k < 64; k++ {
+						(*mcu).ch1[zmap.Map2[k]+128+8] = coeff[k]
 					}
 				case 4:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch1[k] = coeff[zigzag[k]]
+						(*mcu).ch2[k] = coeff[zigzag[k]]
 					}
 				case 5:
 					for k := 0; k < 64; k++ {
-						(*mcu).ch1[k] = coeff[zigzag[k]]
+						(*mcu).ch3[k] = coeff[zigzag[k]]
 					}
 				}
 			}
 		}
+		// Add here
 		header.MCUArray = append(header.MCUArray, *mcu)
 	}
 }
@@ -676,6 +782,15 @@ func decodeJPEG(filename string) {
 	// Decode the MCU Coeffecients
 	decodeMCUCoeffecients(header)
 	fmt.Printf("Len (%d)\n", len(header.MCUArray))
+	_mcu := header.MCUArray[10]
+	chann := &_mcu.ch1
+	for k := 0; k < 256; k++ {
+		if k%16 == 0 {
+			fmt.Printf("\n")
+		}
+		fmt.Printf("%d ", (*chann)[k])
+	}
+	fmt.Printf("\n")
 }
 
 func generateCodes(tb *HuffmanTable) {
