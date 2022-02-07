@@ -3,8 +3,10 @@ package main
 import (
 	"dec/zmap"
 	"fmt"
+	"math"
 	"os"
 	"path"
+	"strings"
 )
 
 type Buffer struct {
@@ -190,7 +192,7 @@ func decodeStartOfFrame(h *Header) {
 
 }
 
-func read64Coeffecients(br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int) *[64]int {
+func read64Coeffecients(br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int, first bool) *[64]int {
 	res := [64]int{}
 	// Read the DC Coeffecient
 	sym := scanSymbol(br, dcHuffmanTable)
@@ -200,8 +202,10 @@ func read64Coeffecients(br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTa
 	if dcLength != 0 && dcCoeffecient < (1<<(dcLength-1)) {
 		dcCoeffecient -= (1<<dcLength - 1)
 	}
-	dcCoeffecient += *prevDC
-	*prevDC = dcCoeffecient
+	if first {
+		dcCoeffecient += *prevDC
+		*prevDC = dcCoeffecient
+	}
 	res[0] = dcCoeffecient
 	// Read the remaining 63 AC Coeffecients
 	index := 1
@@ -257,7 +261,8 @@ func getTable(header *Header, dc bool, Id int) *HuffmanTable {
 }
 
 // Helper function to get the correct quantization table
-func getQuantizationTable(header *Header, tId int) *QuantizationTable {
+func getQuantizationTable(header *Header, index int) *QuantizationTable {
+	tId := header.cComponents[index].qTableId
 	for a := range header.qTables {
 		t := header.qTables[a]
 		if t.Id == tId {
@@ -265,6 +270,178 @@ func getQuantizationTable(header *Header, tId int) *QuantizationTable {
 		}
 	}
 	return nil
+}
+
+// Helper function to perform inverse DCT on 8x8 block
+func inverseDCTPixel(x int, y int, channel *[64]int) int {
+	sum := float64(0)
+	for u := 0; u < 8; u++ {
+		for v := 0; v < 8; v++ {
+			coeff := float64((*channel)[u+v*8])
+			cos1 := math.Cos((float64((2*x + 1)) * float64(u) * float64(math.Pi)) / 16)
+			cos2 := math.Cos((float64((2*y + 1)) * float64(v) * float64(math.Pi)) / 16)
+			if u == 0 {
+				if v == 0 {
+					sum += (float64(1) / float64(2)) * coeff * cos1 * cos2
+				} else {
+					sum += (float64(1) / math.Sqrt(2)) * coeff * cos1 * cos2
+				}
+			} else {
+				if v == 0 {
+					sum += (float64(1) / math.Sqrt(2)) * coeff * cos1 * cos2
+				} else {
+					sum += coeff * cos1 * cos2
+				}
+			}
+		}
+	}
+	return int(sum * 0.25)
+}
+
+func inverseDCT(header *Header) {
+	for a := range header.MCUArray {
+		mcu := &header.MCUArray[a]
+		arr := mcu.getArraySections(header)
+		switch header.mcuDimensions {
+		case _8x8:
+			arr1 := [64]int{}
+			arr2 := [64]int{}
+			arr3 := [64]int{}
+
+			for y := 0; y < 8; y++ {
+				for x := 0; x < 8; x++ {
+					arr1[x+8*y] = inverseDCTPixel(x, y, &arr[0])
+					arr2[x+8*y] = inverseDCTPixel(x, y, &arr[1])
+					arr3[x+8*y] = inverseDCTPixel(x, y, &arr[2])
+				}
+			}
+
+			// reset the values
+			index := 0
+			for k := 0; k < 8; k++ {
+				base := 8 * k
+				for j := base; j < base+8; j++ {
+					(*mcu).ch1[j] = arr1[index]
+					(*mcu).ch2[j] = arr2[index]
+					(*mcu).ch3[j] = arr3[index]
+					index++
+				}
+			}
+		case _16x8:
+			arr1 := [64]int{}
+			arr2 := [64]int{}
+			arr3 := [64]int{}
+			arr4 := [64]int{}
+			arr5 := [64]int{}
+			arr6 := [64]int{}
+
+			for y := 0; y < 8; y++ {
+				for x := 0; x < 8; x++ {
+					arr1[x+y*8] = inverseDCTPixel(x, y, &arr[0])
+					arr2[x+y*8] = inverseDCTPixel(x, y, &arr[1])
+					arr3[x+y*8] = inverseDCTPixel(x, y, &arr[2])
+					arr4[x+y*8] = inverseDCTPixel(x, y, &arr[3])
+					arr5[x+y*8] = inverseDCTPixel(x, y, &arr[4])
+					arr6[x+y*8] = inverseDCTPixel(x, y, &arr[5])
+				}
+			}
+
+			// Reset the values
+			index := 0
+			for k := 0; k < 8; k++ {
+				base := 16 * k
+				for j := base; j < base+8; j++ {
+					(*mcu).ch1[j] = arr1[index]
+					(*mcu).ch2[j] = arr2[index]
+					(*mcu).ch3[j] = arr3[index]
+					(*mcu).ch1[j+8] = arr4[index]
+					(*mcu).ch2[j+8] = arr4[index]
+					(*mcu).ch3[j+8] = arr6[index]
+					index++
+				}
+			}
+		case _8x16:
+			arr1 := [64]int{}
+			arr2 := [64]int{}
+			arr3 := [64]int{}
+			arr4 := [64]int{}
+			arr5 := [64]int{}
+			arr6 := [64]int{}
+
+			for y := 0; y < 8; y++ {
+				for x := 0; x < 8; x++ {
+					arr1[x+8*y] = inverseDCTPixel(x, y, &arr[0])
+					arr2[x+8*y] = inverseDCTPixel(x, y, &arr[1])
+					arr3[x+8*y] = inverseDCTPixel(x, y, &arr[2])
+					arr4[x+8*y] = inverseDCTPixel(x, y, &arr[3])
+					arr5[x+8*y] = inverseDCTPixel(x, y, &arr[4])
+					arr6[x+8*y] = inverseDCTPixel(x, y, &arr[5])
+				}
+			}
+
+			// Reset the values
+			for k := 0; k < 64; k++ {
+				(*mcu).ch1[k] = arr1[k]
+				(*mcu).ch2[k] = arr2[k]
+				(*mcu).ch3[k] = arr3[k]
+				(*mcu).ch1[k+64] = arr4[k]
+				(*mcu).ch2[k+64] = arr5[k]
+				(*mcu).ch3[k+64] = arr6[k]
+			}
+		case _16x16:
+			arr1 := [64]int{}
+			arr2 := [64]int{}
+			arr3 := [64]int{}
+			arr4 := [64]int{}
+			arr5 := [64]int{}
+			arr6 := [64]int{}
+			arr7 := [64]int{}
+			arr8 := [64]int{}
+			arr9 := [64]int{}
+			arr10 := [64]int{}
+			arr11 := [64]int{}
+			arr12 := [64]int{}
+
+			for y := 0; y < 8; y++ {
+				for x := 0; x < 8; x++ {
+					arr1[x+8*y] = inverseDCTPixel(x, y, &arr[0])
+					arr2[x+8*y] = inverseDCTPixel(x, y, &arr[1])
+					arr3[x+8*y] = inverseDCTPixel(x, y, &arr[2])
+					arr4[x+8*y] = inverseDCTPixel(x, y, &arr[3])
+					arr5[x+8*y] = inverseDCTPixel(x, y, &arr[4])
+					arr6[x+8*y] = inverseDCTPixel(x, y, &arr[5])
+					arr7[x+8*y] = inverseDCTPixel(x, y, &arr[6])
+					arr8[x+8*y] = inverseDCTPixel(x, y, &arr[7])
+					arr9[x+8*y] = inverseDCTPixel(x, y, &arr[8])
+					arr10[x+8*y] = inverseDCTPixel(x, y, &arr[9])
+					arr11[x+8*y] = inverseDCTPixel(x, y, &arr[10])
+					arr12[x+8*y] = inverseDCTPixel(x, y, &arr[11])
+				}
+			}
+
+			// Reset the values
+			index := 0
+			for k := 0; k < 8; k++ {
+				base := 16 * k
+				for j := base; j < base+8; j++ {
+					(*mcu).ch1[j] = arr1[index]
+					(*mcu).ch2[j] = arr2[index]
+					(*mcu).ch3[j] = arr3[index]
+					(*mcu).ch1[j+8] = arr4[index]
+					(*mcu).ch2[j+8] = arr5[index]
+					(*mcu).ch3[j+8] = arr6[index]
+					(*mcu).ch1[j+128] = arr7[index]
+					(*mcu).ch2[j+128] = arr8[index]
+					(*mcu).ch3[j+128] = arr9[index]
+					(*mcu).ch1[j+128+8] = arr10[index]
+					(*mcu).ch2[j+128+8] = arr11[index]
+					(*mcu).ch3[j+128+8] = arr12[index]
+					index++
+				}
+			}
+		}
+
+	}
 }
 
 func dequantize(header *Header) {
@@ -399,7 +576,7 @@ func decodeMCUCoeffecients(header *Header) {
 				comp := header.cComponents[c]
 				acHuffmanTable := getTable(header, false, comp.acHuffmanTableId)
 				dcHuffmanTable := getTable(header, true, comp.dcHuffmanTableId)
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[0])
+				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[c], true)
 				switch c {
 				case 0:
 					for k := 0; k < 64; k++ {
@@ -436,7 +613,23 @@ func decodeMCUCoeffecients(header *Header) {
 					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
 					dcHuffmanTable = getTable(header, true, header.cComponents[2].acHuffmanTableId)
 				}
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[0])
+				var _prevDc *int
+				var first bool = false
+				switch c {
+				case 0:
+					_prevDc = &prevDC[0]
+					first = true
+				case 1:
+					_prevDc = &prevDC[0]
+					first = true
+				case 2:
+					_prevDc = &prevDC[1]
+					first = true
+				case 3:
+					_prevDc = &prevDC[2]
+					first = true
+				}
+				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, _prevDc, first)
 
 				switch c {
 				case 0:
@@ -476,7 +669,19 @@ func decodeMCUCoeffecients(header *Header) {
 					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
 					dcHuffmanTable = getTable(header, true, header.cComponents[2].acHuffmanTableId)
 				}
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[0])
+				var _prevDC *int
+				switch c {
+				case 0:
+					_prevDC = &prevDC[0]
+				case 1:
+					_prevDC = &prevDC[0]
+				case 2:
+					_prevDC = &prevDC[1]
+				case 3:
+					_prevDC = &prevDC[2]
+
+				}
+				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, _prevDC, true)
 				switch c {
 				case 0:
 					for k := 0; k < 64; k++ {
@@ -521,12 +726,7 @@ func decodeMCUCoeffecients(header *Header) {
 					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
 					dcHuffmanTable = getTable(header, true, header.cComponents[2].acHuffmanTableId)
 				}
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[0])
-				if a == 10 {
-					if c == 0 || c == 1 || c == 2 || c == 3 {
-						fmt.Printf("%v\n", coeff)
-					}
-				}
+				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[0], true)
 				switch c {
 				case 0:
 					for k := 0; k < 64; k++ {
@@ -781,16 +981,69 @@ func decodeJPEG(filename string) {
 	}
 	// Decode the MCU Coeffecients
 	decodeMCUCoeffecients(header)
-	fmt.Printf("Len (%d)\n", len(header.MCUArray))
-	_mcu := header.MCUArray[10]
-	chann := &_mcu.ch1
-	for k := 0; k < 256; k++ {
-		if k%16 == 0 {
-			fmt.Printf("\n")
-		}
-		fmt.Printf("%d ", (*chann)[k])
+	//	fmt.Printf("Len (%d)\n", len(header.MCUArray))
+	// Dequantize
+	dequantize(header)
+	// Invese DCT
+	inverseDCT(header)
+	// spread MCU Coeffecients
+	spreadMCU(header)
+	// YCbYCb -> RGB
+	YCbCrToRGB(header)
+	// Write BitMap File
+	writeBitMap(header)
+}
+
+func YCbCrToRGB(header *Header) {
+	mcuWidth := 0
+	mcuHeight := 0
+	switch header.mcuDimensions {
+	case _8x8:
+		mcuWidth = 8
+		mcuHeight = 8
+	case _16x8:
+		mcuWidth = 16
+		mcuHeight = 8
+	case _8x16:
+		mcuWidth = 8
+		mcuHeight = 16
+	case _16x16:
+		mcuWidth = 16
+		mcuHeight = 16
 	}
-	fmt.Printf("\n")
+
+	for a := 0; a < header.mcuCount; a++ {
+		mcu := &header.MCUArray[a]
+		for cf := 0; cf < mcuWidth*mcuHeight; cf++ {
+			cY := &(*mcu).ch1[cf]
+			cCb := &(*mcu).ch2[cf]
+			cCr := &(*mcu).ch3[cf]
+			cR := float32((*cY)) + (1.402 * (float32(*cCr))) + 128
+			cG := float32((*cY)) - (0.344 * (float32(*cCb))) - (0.714 * float32((*cCr))) + 128
+			cB := float32((*cY)) + (1.772 * (float32(*cCb))) + 128
+			if cR < 0 {
+				cR = 0
+			}
+			if cR > 255 {
+				cR = 255
+			}
+			if cB < 0 {
+				cB = 0
+			}
+			if cB > 255 {
+				cB = 255
+			}
+			if cG < 0 {
+				cG = 0
+			}
+			if cG > 255 {
+				cG = 255
+			}
+			*cY = int(cR)
+			*cCb = int(cG)
+			*cCr = int(cB)
+		}
+	}
 }
 
 func generateCodes(tb *HuffmanTable) {
@@ -808,12 +1061,56 @@ func generateCodes(tb *HuffmanTable) {
 	}
 }
 
-/**
+func spreadMCU(header *Header) {
+	for a := 0; a < header.mcuCount; a++ {
+		mcu := &header.MCUArray[a]
+		arr := mcu.getArraySections(header)
+		switch header.mcuDimensions {
+		case _16x8:
+			for k := 0; k < 64; k++ {
+				// Cb
+				(*mcu).ch2[2*k] = arr[1][k]
+				(*mcu).ch2[2*k+1] = arr[1][k]
+				// Cr
+				(*mcu).ch3[2*k] = arr[2][k]
+				(*mcu).ch3[2*k+1] = arr[2][k]
+			}
+		case _8x16:
+			for k := 0; k < 60; k++ {
+				if k < 8 {
+					// Cb
+					(*mcu).ch2[k] = arr[1][k]
+					(*mcu).ch2[k+8] = arr[1][k]
+					// Cr
+					(*mcu).ch3[k] = arr[2][k]
+					(*mcu).ch3[k+8] = arr[2][k]
+				} else {
+					// Cb
+					(*mcu).ch2[2*k] = arr[1][k]
+					(*mcu).ch2[2*k+8] = arr[1][k]
+					// Cr
+					(*mcu).ch3[2*k] = arr[2][k]
+					(*mcu).ch3[2*k+8] = arr[2][k]
+				}
+			}
+		case _16x16:
+			for k := 0; k < 64; k++ {
+				// Cb
+				(*mcu).ch2[2*k] = arr[1][k]
+				(*mcu).ch2[2*k+1] = arr[4][k]
+				(*mcu).ch2[2*k+16] = arr[7][k]
+				(*mcu).ch2[2*k+16+1] = arr[10][k]
+				// Cr
+				(*mcu).ch3[2*k] = arr[2][k]
+				(*mcu).ch3[2*k+1] = arr[5][k]
+				(*mcu).ch3[2*k+16] = arr[8][k]
+				(*mcu).ch3[2*k+16+1] = arr[11][k]
+			}
+		}
+	}
+}
+
 func writeBitMap(header *Header) {
-	// Calculate the MCU Width and MCU Height
-	mcuWidth := (header.width + 7) / 8
-	//mcuHeight := (header.height + 7) / 8
-	// The number of bytes that you need to add
 	paddingSize := header.width % 4
 	// The total size
 	// 14 -> The first header
@@ -831,8 +1128,6 @@ func writeBitMap(header *Header) {
 		fmt.Printf("Error! %s\n", err.Error())
 		os.Exit(1)
 	}
-	// mcuArray
-	mcuArray := *header.MCUArray
 	// Write 'B' 'M'
 	f.Write([]byte("BM"))  // BM
 	put4Int(uint(size), f) // The size of the file as a 4 byte integer
@@ -845,38 +1140,45 @@ func writeBitMap(header *Header) {
 	put2Int(uint(1), f)             // The number of planes as 2 bit integer
 	put2Int(uint(24), f)            // The number of bits per pixel as 2 bit integer
 
-	// Write the pixels
+	maxWidth := 0
+	maxHeight := 0
+	switch header.mcuDimensions {
+	case _8x8:
+		maxWidth = 8
+		maxHeight = 8
+	case _16x8:
+		maxWidth = 16
+		maxHeight = 8
+	case _8x16:
+		maxWidth = 8
+		maxHeight = 16
+	case _16x16:
+		maxWidth = 16
+		maxHeight = 16
+	}
+
 	for y := header.height - 1; y >= 0; y-- {
-		_mcuY := y % 8   // pixel row
-		_mcuRow := y / 8 // The MCU Row
+		_mcuY := y % maxHeight
+		_mcuRow := y / maxHeight
 		for x := 0; x < header.width; x++ {
-			_mcuX := x % 8
-			_mcuColumn := x / 8
-			_mcuIndex := _mcuColumn + (mcuWidth * _mcuRow)
-			_pixelIndex := _mcuY + (8 * _mcuX)
+			_mcuX := x % maxWidth
+			_mcuColumn := x / maxWidth
+			_mcuIndex := _mcuColumn + header.mcuWidth*_mcuRow
+			_pixelIndex := _mcuX + maxWidth*_mcuY
 			// Write the RGB Values
 			rgb := []byte{}
-			rgb = make([]byte, 3)
-			rgb[0] = byte(mcuArray[_mcuIndex].ch3[_pixelIndex])
-			rgb[1] = byte(mcuArray[_mcuIndex].ch2[_pixelIndex])
-			rgb[2] = byte(mcuArray[_mcuIndex].ch1[_pixelIndex])
+			rgb = append(rgb, byte(header.MCUArray[_mcuIndex].ch3[_pixelIndex]))
+			rgb = append(rgb, byte(header.MCUArray[_mcuIndex].ch2[_pixelIndex]))
+			rgb = append(rgb, byte(header.MCUArray[_mcuIndex].ch1[_pixelIndex]))
 			f.Write(rgb)
 		}
-		// After writing the data for a particular row, add the padding bytes
-		padd := []byte{}
-		padd = make([]byte, paddingSize)
-		for k := range padd {
-			padd[k] = 0x00
-		}
-		_, err := f.Write(padd)
-		if err != nil {
-			fmt.Printf("Error! %s\n", err.Error())
-			os.Exit(1)
-		}
+		padding := []byte{}
+		padding = make([]byte, paddingSize)
+		f.Write(padding)
 	}
 	f.Close()
 }
-**/
+
 // Helper function to write a 4 byte integer in little endian
 func put4Int(a uint, f *os.File) {
 	data := []byte{}
@@ -979,6 +1281,71 @@ func getMCU(header *Header) *MCU {
 		return &MCU{make([]int, 128), make([]int, 128), make([]int, 128)}
 	case _16x16:
 		return &MCU{make([]int, 256), make([]int, 256), make([]int, 256)}
+	}
+	return nil
+}
+
+// Helper functions to get the [64]int from the MCU
+func (mcu *MCU) getArraySections(header *Header) [][64]int {
+	res := [][64]int{}
+	switch header.mcuDimensions {
+	case _8x8:
+		res = make([][64]int, 3)
+		for k := 0; k < 64; k++ {
+			res[0][k] = (*mcu).ch1[k]
+			res[1][k] = (*mcu).ch2[k]
+			res[2][k] = (*mcu).ch3[k]
+		}
+		return res
+	case _16x8:
+		res = make([][64]int, 6)
+		index := 0
+		for a := 0; a < 8; a++ {
+			base := 16 * a
+			for k := base; k < base+8; k++ {
+				res[0][index] = (*mcu).ch1[k]
+				res[1][index] = (*mcu).ch2[k]
+				res[2][index] = (*mcu).ch3[k]
+				res[3][index] = (*mcu).ch1[k+8]
+				res[4][index] = (*mcu).ch2[k+8]
+				res[5][index] = (*mcu).ch3[k+8]
+				index++
+			}
+		}
+		return res
+	case _8x16:
+		res = make([][64]int, 6)
+		for k := 0; k < 64; k++ {
+			res[0][k] = (*mcu).ch1[k]
+			res[1][k] = (*mcu).ch2[k]
+			res[2][k] = (*mcu).ch3[k]
+			res[3][k] = (*mcu).ch1[k+64]
+			res[4][k] = (*mcu).ch2[k+64]
+			res[5][k] = (*mcu).ch3[k+64]
+		}
+		return res
+	case _16x16:
+		res = make([][64]int, 12)
+		index := 0
+		for a := 0; a < 8; a++ {
+			base := 16 * a
+			for k := base; k < base+8; k++ {
+				res[0][index] = (*mcu).ch1[k]
+				res[1][index] = (*mcu).ch2[k]
+				res[2][index] = (*mcu).ch3[k]
+				res[3][index] = (*mcu).ch1[k+8]
+				res[4][index] = (*mcu).ch2[k+8]
+				res[5][index] = (*mcu).ch3[k+8]
+				res[6][index] = (*mcu).ch1[k+128]
+				res[7][index] = (*mcu).ch2[k+128]
+				res[8][index] = (*mcu).ch3[k+128]
+				res[9][index] = (*mcu).ch1[k+128+8]
+				res[10][index] = (*mcu).ch2[k+128+8]
+				res[11][index] = (*mcu).ch3[k+128+8]
+				index++
+			}
+			return res
+		}
 	}
 	return nil
 }
