@@ -87,6 +87,8 @@ func decodeQuantizationTables(header *Header) {
 
 func decodeStartOfFrame(h *Header) {
 	fmt.Printf("** Decoding Start Of Frame (0xFF%X) **\n", h.buffer.bf[0])
+	// Set the frameType of the image
+	h.frameType = h.buffer.bf[0]
 	buf := h.buffer
 	buf.advance()
 	buf.advance()
@@ -192,57 +194,81 @@ func decodeStartOfFrame(h *Header) {
 
 }
 
-func read64Coeffecients(br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int) *[64]int {
+func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int, skips *int) *[64]int {
 	res := [64]int{}
-	// Read the DC Coeffecient
-	sym := scanSymbol(br, dcHuffmanTable)
-	dcLength := int(sym)
-	// Since the length == 0
-	dcCoeffecient := br.readBits(dcLength)
-	if dcLength != 0 && dcCoeffecient < (1<<(dcLength-1)) {
-		dcCoeffecient -= (1<<dcLength - 1)
-	}
-	dcCoeffecient += *prevDC
-	*prevDC = dcCoeffecient
-	res[0] = dcCoeffecient
-	// Read the remaining 63 AC Coeffecients
-	index := 1
-	for {
-		if index > 63 {
-			break
+	if header.frameType == SOF2 {
+		// Progressive JPGs
+		if header.startOfSelection == 0 && header.successiveApproximationHigh == 0 {
+			/** DC First Visit **/
+			sym := scanSymbol(br, dcHuffmanTable)
+			dcLength := int(sym)
+			dcCoeffecient := br.readBits(dcLength)
+			if dcLength != 0 && dcCoeffecient < (1<<(dcLength-1)) {
+				dcCoeffecient -= (1<<dcLength - 1)
+			}
+			dcCoeffecient += *prevDC
+			*prevDC = dcCoeffecient
+			res[0] = dcCoeffecient << header.successiveApproximationHigh
+		} else if header.startOfSelection != 0 && header.successiveApproximationHigh == 0 {
+			if *skips > 0 {
+				*skips -= 1
+				return &res
+			}
+			// start at the start of selection of the band
+			start := int(header.startOfSelection)
+			end := int(header.endOfSelection)
+			index := start
+			for {
+				// end at the header end of selection
+				if index > end {
+					break
+				}
+				sym := scanSymbol(br, acHuffmanTable)
+				if sym == 0xff {
+					fmt.Printf("Error! Invalid symbol 0xff found\n")
+					os.Exit(1)
+				}
+				switch sym {
+				case 0xF0:
+					// 0xF0 means the next 16 coeffecients are 0
+					max := index + 16
+					for a := index; a < max; a++ {
+						res[a] = 0
+						index++
+					}
+				default:
+					numZeros := int(sym >> 4)
+					acLength := int(sym & 0x0F)
+					if acLength != 0 {
+						max := index + numZeros
+						for a := index; a < max; a++ {
+							res[a] = 0
+							index++
+						}
+						acCoeffecient := br.readBits(acLength)
+						if acCoeffecient < (1 << (acLength - 1)) {
+							acCoeffecient -= (1<<acLength - 1)
+						}
+						res[index] = acCoeffecient
+						index++
+					} else {
+						_skips := (1 << numZeros) - 1
+						_extra := br.readBits(numZeros)
+						if _extra == 0xff {
+							fmt.Printf("Error! Invalid EOB\n")
+							os.Exit(1)
+						}
+						_skips += _extra
+						*skips = _skips
+						// Once you have reached the end-of-band marker you should return &res
+						// this is because you are done with the current block
+						return &res
+					}
+
+				}
+			}
 		}
-		sym := scanSymbol(br, acHuffmanTable)
-		switch sym {
-		case 0x00:
-			// 0x00 means the remaining coeffecients are all 0
-			for a := index; a <= 63; a++ {
-				res[a] = 0
-				index++
-			}
-			continue
-		case 0xF0:
-			// 0x0F means the next 16 coeffecients are 0
-			max := index + 16
-			for a := index; a < max; a++ {
-				res[a] = 0
-				index++
-			}
-			continue
-		default:
-			numZeros := int(sym >> 4)
-			acLength := int(sym & 0x0F)
-			max := index + numZeros
-			for a := index; a < max; a++ {
-				res[a] = 0
-				index++
-			}
-			acCoeffecient := br.readBits(acLength)
-			if acCoeffecient < (1 << (acLength - 1)) {
-				acCoeffecient -= (1<<acLength - 1)
-			}
-			res[index] = acCoeffecient
-			index++
-		}
+		return &res
 	}
 	return &res
 }
@@ -561,34 +587,35 @@ func dequantize(header *Header) {
 	}
 }
 
-func decodeMCUCoeffecients(header *Header) {
-	// Initialize the MCUArray
-	br := BitReader{data: &header.bitstream}
+func decodeMCUCoeffecients(header *Header, br BitReader) {
 	prevDC := [3]int{0, 0, 0}
+	skips := 0
 	for a := 0; a < header.mcuCount; a++ {
 		// Get a new MCU Object with the correct dimensions
 		mcu := getMCU(header)
 		switch header.mcuDimensions {
 		case _8x8:
-			for c := 0; c < 3; c++ {
+			for c := range header.cComponents {
 				comp := header.cComponents[c]
-				acHuffmanTable := getTable(header, false, comp.acHuffmanTableId)
-				dcHuffmanTable := getTable(header, true, comp.dcHuffmanTableId)
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, &prevDC[c])
-				switch c {
-				case 0:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch1[zmap.Map1[k]] = coeff[k]
-					}
+				if comp.usedInScan {
+					acHuffmanTable := getTable(header, false, comp.acHuffmanTableId)
+					dcHuffmanTable := getTable(header, true, comp.dcHuffmanTableId)
+					coeff := read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, &prevDC[c], &skips)
+					switch c {
+					case 0:
+						for k := 0; k < 64; k++ {
+							(*mcu).ch1[zmap.Map1[k]] = coeff[k]
+						}
 
-				case 1:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch2[zmap.Map1[k]] = coeff[k]
-					}
+					case 1:
+						for k := 0; k < 64; k++ {
+							(*mcu).ch2[zmap.Map1[k]] = coeff[k]
+						}
 
-				case 2:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch3[zmap.Map1[k]] = coeff[k]
+					case 2:
+						for k := 0; k < 64; k++ {
+							(*mcu).ch3[zmap.Map1[k]] = coeff[k]
+						}
 					}
 				}
 			}
@@ -622,7 +649,7 @@ func decodeMCUCoeffecients(header *Header) {
 				case 3:
 					_prevDc = &prevDC[2]
 				}
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, _prevDc)
+				coeff := read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDc, &skips)
 
 				switch c {
 				case 0:
@@ -674,7 +701,7 @@ func decodeMCUCoeffecients(header *Header) {
 					_prevDC = &prevDC[2]
 
 				}
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, _prevDC)
+				coeff := read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDC, &skips)
 				switch c {
 				case 0:
 					for k := 0; k < 64; k++ {
@@ -734,7 +761,7 @@ func decodeMCUCoeffecients(header *Header) {
 				case 5:
 					_prevDC = &prevDC[2]
 				}
-				coeff := read64Coeffecients(&br, acHuffmanTable, dcHuffmanTable, _prevDC)
+				coeff := read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDC, &skips)
 				switch c {
 				case 0:
 					for k := 0; k < 64; k++ {
@@ -768,7 +795,7 @@ func decodeMCUCoeffecients(header *Header) {
 	}
 }
 
-func decodeRestartInterval(header *Header) {
+func decodeDefineRestartInterval(header *Header) {
 	buf := header.buffer
 	fmt.Printf("** Decoding Define Restart Interval (0xFF%X)**\n", buf.bf[0])
 	buf.advance()
@@ -785,6 +812,10 @@ func decodeRestartInterval(header *Header) {
 }
 
 func decodeDefineHuffmanTable(header *Header) {
+	// Set the value of newInScan for all current tables = false
+	for t := range header.huffmanTables {
+		header.huffmanTables[t].newInScan = false
+	}
 	buf := header.buffer
 	fmt.Printf("** Decoding Define Huffman Table (0xFF%X) **\n", buf.bf[0])
 	buf.advance()
@@ -800,8 +831,9 @@ func decodeDefineHuffmanTable(header *Header) {
 		tableId := int(buf.bf[0] & 0x0F)
 		// Create the new table
 		table := HuffmanTable{
-			Id: tableId,
-			dc: dc,
+			Id:        tableId,
+			dc:        dc,
+			newInScan: true,
 		}
 		// Read the codes of len
 		count := 0
@@ -816,7 +848,19 @@ func decodeDefineHuffmanTable(header *Header) {
 			length -= 1
 			table.symbols = append(table.symbols, buf.bf[0])
 		}
-		header.huffmanTables = append(header.huffmanTables, table)
+		// For progressive JPGs there are new huffman-tables, thus check for tables that have the same id
+		_newTables := []HuffmanTable{}
+		for t := range header.huffmanTables {
+			tb := header.huffmanTables[t]
+			if tb.dc == dc && tb.Id == tableId {
+				// Remove the (ac/dc) table with the same id as the new table
+				continue
+			}
+			_newTables = append(_newTables, tb)
+		}
+		// Add the new table which replaces the previous table that had the same id
+		_newTables = append(_newTables, table)
+		header.huffmanTables = _newTables
 	}
 	if length != 0 {
 		fmt.Printf("Error! Invalid DefineHuffanTable Marker\n")
@@ -828,7 +872,63 @@ func endScan(header *Header) {
 	fmt.Printf("*** EOI (0xFF%X) ***\n", buf.bf[0])
 }
 
+// Helper function to print the scan information
+func printScanInfo(header *Header) {
+	fmt.Printf("*** SCAN ***\n")
+	fmt.Printf("** Huffman Tables (%d) **\n", len(header.huffmanTables))
+	for t := range header.huffmanTables {
+		tb := header.huffmanTables[t]
+		if tb.newInScan {
+			fmt.Printf("table id: %d ", tb.Id)
+			if tb.dc {
+				fmt.Printf("DC")
+			} else {
+				fmt.Printf("AC")
+			}
+			fmt.Printf("\n")
+			fmt.Printf("Start Of Selection           : %d\n", header.startOfSelection)
+			fmt.Printf("End Of Selection             : %d\n", header.endOfSelection)
+			fmt.Printf("Succesive Approximation High : %d\n", header.successiveApproximationHigh)
+			fmt.Printf("Succesive Approximation Low  : %d\n", header.successiveApproximationLow)
+			fmt.Printf("# of components              : %d\n", header.componentsInScan)
+			if false {
+				fmt.Printf("--- Symbols ---\n")
+				lastIndex := 0
+
+				for a := byte(0); a < 16; a++ {
+					fmt.Printf("%s -> ", pad(a))
+					codesOfLen := tb.codesOfLen[int(a)]
+					for c := lastIndex; c < lastIndex+codesOfLen; c++ {
+						fmt.Printf("%x ", tb.symbols[c])
+					}
+					lastIndex += codesOfLen
+					fmt.Printf("\n")
+				}
+			}
+			fmt.Printf("\n")
+			if false {
+				fmt.Printf("--- Codes ---\n")
+				lastIndex := 0
+				for a := byte(0); a < 16; a++ {
+					fmt.Printf("LEN (%d)\n", a)
+					codesOfLen := tb.codesOfLen[int(a)]
+					for c := lastIndex; c < lastIndex+codesOfLen; c++ {
+						fmt.Printf("%b\n", tb.codes[c])
+					}
+					fmt.Printf("\n")
+					lastIndex += codesOfLen
+				}
+				fmt.Printf("\n")
+			}
+		}
+	}
+}
+
 func decodeStartOfScan(header *Header) {
+	// Set the usedInScan prop of all components to false
+	for c := range header.cComponents {
+		header.cComponents[c].usedInScan = false
+	}
 	buf := header.buffer
 	fmt.Printf("** Decoding Start of Scan (0xFF%X) **\n", buf.bf[0])
 	buf.advance()
@@ -837,6 +937,8 @@ func decodeStartOfScan(header *Header) {
 	buf.advance()
 	length -= 1
 	components := int(buf.bf[0])
+	// Set header.componentsInScan
+	header.componentsInScan = components
 	for a := 0; a < components; a++ {
 		buf.advance()
 		length -= 1
@@ -854,6 +956,7 @@ func decodeStartOfScan(header *Header) {
 			if compId == comp.Id {
 				comp.acHuffmanTableId = int(acHuffmanTableId)
 				comp.dcHuffmanTableId = int(dcHuffmanTableId)
+				comp.usedInScan = true
 			}
 		}
 	}
@@ -869,8 +972,10 @@ func decodeStartOfScan(header *Header) {
 	header.successiveApproximationLow = buf.bf[0] & 0x0F
 	/** Begin the SCAN **/
 	buf.advance()
+	// The ECS provided by the current scan
+	_bitstream := []byte{}
+	// This loop should only get the ECS and break when we encounter a valid marker
 	for {
-		// The only markers that are allowed in the scan are RSTn Markers and the EOI Marker
 		if buf.bf[0] == 0xFF {
 			buf.advance()
 			if buf.bf[0] == 0xFF {
@@ -878,20 +983,60 @@ func decodeStartOfScan(header *Header) {
 				continue
 			} else if buf.bf[0] >= RST0 && buf.bf[0] <= RST7 {
 				buf.advance()
-				continue
 			} else if buf.bf[0] == EOI {
-				endScan(header)
+				break
+			} else if buf.bf[0] == DRI && header.frameType == SOF2 {
+				break
+			} else if buf.bf[0] == DHT && header.frameType == SOF2 {
+				break
+			} else if buf.bf[0] == SOS && header.frameType == SOF2 {
 				break
 			} else if buf.bf[0] == 0x00 {
-				header.bitstream = append(header.bitstream, 0xFF)
+				// If one or more than one '0xff' bytes is followed by '0x00' then save a single '0xff'
+				_bitstream = append(_bitstream, 0xff)
 				buf.advance()
-				continue
+			} else {
+				fmt.Printf("Invalid marker (0xFF%X) found in the bitsteam\n", buf.bf[0])
+				os.Exit(1)
 			}
-			fmt.Printf("Ivalid Byte (0xFF%X) found in the bitsteam\n", buf.bf[0])
-			os.Exit(1)
 		}
-		header.bitstream = append(header.bitstream, buf.bf[0])
+		_bitstream = append(_bitstream, buf.bf[0])
 		buf.advance()
+	}
+	// Generate huffman codes for all the huffman tables
+	for t := range header.huffmanTables {
+		tb := &header.huffmanTables[t]
+		generateCodes(tb)
+	}
+	// Print the length of the bitstream
+	fmt.Printf("len(bitstream) = %d\n", len(_bitstream))
+	// Print the scan info
+	printScanInfo(header)
+	// Decode the MCU Coeffecients
+	decodeMCUCoeffecients(header, BitReader{data: &_bitstream})
+	// Continue reading the other markers
+	for {
+		if buf.bf[0] == 0xff {
+			buf.advance()
+			continue
+		}
+		// Check for markers
+		if buf.bf[0] == DRI && header.frameType == SOF2 {
+			decodeDefineRestartInterval(header)
+			buf.advance()
+		}
+		if buf.bf[0] == SOS && header.frameType == SOF2 {
+			decodeStartOfScan(header)
+			break
+		}
+		if buf.bf[0] == DHT && header.frameType == SOF2 {
+			decodeDefineHuffmanTable(header)
+			buf.advance()
+		}
+		if buf.bf[0] == EOI {
+			fmt.Printf("*** Reached the end-of-image marker\n")
+			break
+		}
 	}
 }
 
@@ -947,8 +1092,10 @@ func decodeJPEG(filename string) {
 			decodeQuantizationTables(header)
 		} else if buffer.bf[0] == SOF0 {
 			decodeStartOfFrame(header)
+		} else if buffer.bf[0] == SOF2 {
+			decodeStartOfFrame(header)
 		} else if buffer.bf[0] == DRI {
-			decodeRestartInterval(header)
+			decodeDefineRestartInterval(header)
 		} else if buffer.bf[0] == DHT {
 			decodeDefineHuffmanTable(header)
 		} else if buffer.bf[0] == SOS {
@@ -982,23 +1129,6 @@ func decodeJPEG(filename string) {
 		buffer.advance()
 	}
 	file.Close()
-	// Decode Codes for every huffanTable
-	for t := range header.huffmanTables {
-		tb := &header.huffmanTables[t]
-		generateCodes(tb)
-	}
-	// Decode the MCU Coeffecients
-	decodeMCUCoeffecients(header)
-	// Dequantize
-	dequantize(header)
-	// Invese DCT
-	inverseDCT(header)
-	//spread MCU Coeffecients
-	//spreadMCU(header)
-	// YCbYCb -> RGB
-	YCbCrToRGB(header)
-	// Write BitMap File
-	writeBitMap(header)
 }
 
 func YCbCrToRGB(header *Header) {
@@ -1139,6 +1269,7 @@ func writeBitMap(header *Header) {
 		fmt.Printf("Error! %s\n", err.Error())
 		os.Exit(1)
 	}
+	fmt.Printf("Writing bitmap to %s ... \n", filename)
 	// Write 'B' 'M'
 	f.Write([]byte("BM"))  // BM
 	put4Int(uint(size), f) // The size of the file as a 4 byte integer
@@ -1629,6 +1760,7 @@ type HuffmanTable struct {
 	symbols    []byte
 	codesOfLen [16]int
 	dc         bool
+	newInScan  bool // Is the table new from the most recset scan
 }
 
 // The mcu dimensions
@@ -1661,6 +1793,8 @@ type Header struct {
 	mcuHeight                   int
 	mcuDimensions               int
 	mcuCount                    int
+	componentsInScan            int  // The numnber of components used in the scan
+	frameType                   byte // SOF0 or SOF2
 }
 
 type ColorComponent struct {
@@ -1670,6 +1804,7 @@ type ColorComponent struct {
 	qTableId         int
 	acHuffmanTableId int
 	dcHuffmanTableId int
+	usedInScan       bool // Is this component used in the scan
 }
 
 func main() {
