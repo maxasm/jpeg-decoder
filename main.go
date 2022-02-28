@@ -15,8 +15,7 @@ type Buffer struct {
 }
 
 func (bf *Buffer) advance() {
-	data := []byte{}
-	data = make([]byte, 1)
+	data := make([]byte, 1)
 	_, err := bf.f.Read(data)
 	// Since we need to read the EOI marker before we get to the end of the file
 	// We just os.Exit(1) if we get get to the end of file first
@@ -187,6 +186,12 @@ func decodeStartOfFrame(h *Header) {
 		fmt.Printf("Error! invalid Sampling Factor\n")
 	}
 	h.mcuCount = h.mcuWidth * h.mcuHeight
+	_arr := make([]MCU, h.mcuCount)
+	h.MCUArray = &_arr
+	// Create all the mcus needed for the image
+	for m := 0; m < h.mcuCount; m++ {
+		(*h.MCUArray)[m] = getMCU(h)
+	}
 	// Check if len == 0
 	if length != 0 {
 		fmt.Printf("Error! Invalid Start Of Frame\n")
@@ -194,83 +199,195 @@ func decodeStartOfFrame(h *Header) {
 
 }
 
-func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int, skips *int) *[64]int {
-	res := [64]int{}
-	if header.frameType == SOF2 {
-		// Progressive JPGs
-		if header.startOfSelection == 0 && header.successiveApproximationHigh == 0 {
-			/** DC First Visit **/
-			sym := scanSymbol(br, dcHuffmanTable)
-			dcLength := int(sym)
-			dcCoeffecient := br.readBits(dcLength)
-			if dcLength != 0 && dcCoeffecient < (1<<(dcLength-1)) {
-				dcCoeffecient -= (1<<dcLength - 1)
+// for refinement you need the previous 64 coeffecients
+func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int, skips *int, channel *[]int) {
+	// Progressive JPGs
+	if header.startOfSelection == 0 && header.successiveApproximationHigh == 0 {
+		/** DC First Visit **/
+		sym := scanSymbol(br, dcHuffmanTable)
+		dcLength := int(sym)
+		dcCoeffecient := br.readBits(dcLength)
+		if dcLength != 0 && dcCoeffecient < (1<<(dcLength-1)) {
+			dcCoeffecient -= (1<<dcLength - 1)
+		}
+		dcCoeffecient += *prevDC
+		*prevDC = dcCoeffecient
+		(*channel)[0] = dcCoeffecient << header.successiveApproximationLow
+	} else if header.startOfSelection != 0 && header.successiveApproximationHigh == 0 {
+		/** AC First Visit **/
+		if *skips > 0 {
+			*skips -= 1
+			return
+		}
+		// start at the start of selection of the band
+		start := int(header.startOfSelection)
+		end := int(header.endOfSelection)
+		index := start
+		for {
+			// end at the header end of selection
+			if index > end {
+				break
 			}
-			dcCoeffecient += *prevDC
-			*prevDC = dcCoeffecient
-			res[0] = dcCoeffecient << header.successiveApproximationHigh
-		} else if header.startOfSelection != 0 && header.successiveApproximationHigh == 0 {
-			if *skips > 0 {
-				*skips -= 1
-				return &res
+			sym := scanSymbol(br, acHuffmanTable)
+			if sym == 0xff {
+				fmt.Printf("Error! Invalid symbol 0xff found\n")
+				os.Exit(1)
 			}
-			// start at the start of selection of the band
-			start := int(header.startOfSelection)
-			end := int(header.endOfSelection)
-			index := start
-			for {
-				// end at the header end of selection
-				if index > end {
-					break
+			switch sym {
+			case 0xF0:
+				// 0xF0 means the next 16 coeffecients are 0
+				max := index + 16
+				for a := index; a < max; a++ {
+					(*channel)[zmap.Map1[a]] = 0
+					index++
 				}
-				sym := scanSymbol(br, acHuffmanTable)
-				if sym == 0xff {
-					fmt.Printf("Error! Invalid symbol 0xff found\n")
-					os.Exit(1)
-				}
-				switch sym {
-				case 0xF0:
-					// 0xF0 means the next 16 coeffecients are 0
-					max := index + 16
+			default:
+				numZeros := int(sym >> 4)
+				acLength := int(sym & 0x0F)
+				if acLength != 0 {
+					max := index + numZeros
 					for a := index; a < max; a++ {
-						res[a] = 0
+						(*channel)[zmap.Map1[a]] = 0
 						index++
 					}
-				default:
-					numZeros := int(sym >> 4)
-					acLength := int(sym & 0x0F)
-					if acLength != 0 {
-						max := index + numZeros
-						for a := index; a < max; a++ {
-							res[a] = 0
-							index++
-						}
-						acCoeffecient := br.readBits(acLength)
-						if acCoeffecient < (1 << (acLength - 1)) {
-							acCoeffecient -= (1<<acLength - 1)
-						}
-						res[index] = acCoeffecient
-						index++
-					} else {
-						_skips := (1 << numZeros) - 1
-						_extra := br.readBits(numZeros)
-						if _extra == 0xff {
-							fmt.Printf("Error! Invalid EOB\n")
-							os.Exit(1)
-						}
-						_skips += _extra
-						*skips = _skips
-						// Once you have reached the end-of-band marker you should return &res
-						// this is because you are done with the current block
-						return &res
+					acCoeffecient := br.readBits(acLength)
+					if acCoeffecient < (1 << (acLength - 1)) {
+						acCoeffecient -= (1<<acLength - 1)
 					}
-
+					(*channel)[zmap.Map1[index]] = acCoeffecient << int(header.successiveApproximationLow)
+					index++
+				} else {
+					_skips := (1 << numZeros) - 1
+					_extra := br.readBits(numZeros)
+					if _extra == 0xff {
+						fmt.Printf("Error! Invalid EOB\n")
+						os.Exit(1)
+					}
+					_skips += _extra
+					*skips = _skips
+					// Once you have reached the end-of-band marker you should return &res
+					// this is because you are done with the current block
+					return
 				}
 			}
 		}
-		return &res
+	} else if header.startOfSelection == 0 && header.successiveApproximationHigh != 0 {
+		// For DC refinement all you need to do is read a single bit,
+		// shift it left by successiveApproximationHight, then bin-or it with the current DC coeffecient
+		bit := br.readBit()
+		if bit == 0xff {
+			fmt.Printf("Error! invalid DC refinment bit read\n")
+			os.Exit(1)
+		}
+		(*channel)[0] |= bit << header.successiveApproximationHigh
+	} else if header.startOfSelection != 0 && header.successiveApproximationHigh != 0 {
+		// negative and positie bits
+		positive := 1 << header.successiveApproximationLow
+		negative := -1 << header.successiveApproximationLow
+		index := int(header.startOfSelection)
+
+		if *skips == 0 {
+			// Perform huffman-decoding, read a new bit for every non-zero coeffecient
+			for {
+				if index > int(header.endOfSelection) {
+					break
+				}
+				sym := scanSymbol(br, acHuffmanTable)
+				// fmt.Printf("sym -> %x, index -> %d, skips -> %d\n", sym, index, *skips)
+				// check if the symbol is valid
+				if sym == 0xff {
+					fmt.Printf("Error! Invalid symbol 0xff\n")
+					os.Exit(1)
+				}
+				// get the number of zeroes and the coeffecient lenght
+				zeroes := sym >> 4
+				coeffLen := sym & 0x0f
+				// the coeffecient that will be set
+				coeff := 0
+
+				// coeffLen should be 1 because this is a refinment scan
+				if coeffLen != 0 {
+					if coeffLen != 1 {
+						fmt.Printf("Error! Invalid coeffLen expected %d but got %d\n", 1, coeffLen)
+						os.Exit(1)
+					}
+					bit := br.readBit()
+					if bit == 1 {
+						coeff = positive
+					} else if bit == 0 {
+						coeff = negative
+					} else {
+						fmt.Printf("Error\n")
+						os.Exit(1)
+					}
+				}
+
+				// check for end-of-band symbols
+				if coeffLen == 0 && sym != 0xf0 {
+					*skips = (1 << zeroes) + br.readBits(int(zeroes))
+					// fmt.Printf("eob -> %d\n", *skips)
+					break
+				}
+				// check for special symbol 0xf0 -> 16 zeroes
+				// fmt.Printf("zeroes -> %x\n", zeroes)
+				// Handle the zeroes
+				for {
+					// read a new bit for every non-zero coeffecient
+					if (*channel)[zmap.Map1[index]] != 0 {
+						bit := br.readBit()
+						if bit == 1 {
+							if (*channel)[zmap.Map1[index]] >= 0 {
+								(*channel)[zmap.Map1[index]] += positive
+							} else {
+								(*channel)[zmap.Map1[index]] += negative
+							}
+						} else if bit == 0 {
+							// do nothing
+						} else {
+							fmt.Printf("Error bit -> %d\n", bit)
+							os.Exit(1)
+						}
+					} else {
+						if zeroes == 0 {
+							break
+						}
+						zeroes -= 1
+					}
+					index += 1
+				}
+				// fmt.Printf("afterz -> %x\n", index)
+				// set the coeffecient
+				(*channel)[zmap.Map1[index]] = coeff
+				index += 1
+			}
+		}
+
+		if *skips > 0 {
+			for {
+				if index > int(header.endOfSelection) {
+					break
+				}
+				// read a new bit for every non-zero coeffeceint
+				if (*channel)[zmap.Map1[index]] != 0 {
+					bit := br.readBit()
+					if bit == 1 {
+						if (*channel)[zmap.Map1[index]] >= 0 {
+							(*channel)[zmap.Map1[index]] += positive
+						} else {
+							(*channel)[zmap.Map1[index]] += negative
+						}
+					} else if bit == 0 {
+						// do nothing
+					} else {
+						fmt.Printf("Error bit 2-> %d\n", bit)
+						os.Exit(1)
+					}
+				}
+				index += 1
+			}
+			*skips -= 1
+		}
 	}
-	return &res
 }
 
 // Helper function to get the correct *HuffmanTable
@@ -323,8 +440,8 @@ func inverseDCTPixel(x int, y int, channel *[64]int) int {
 }
 
 func inverseDCT(header *Header) {
-	for a := range header.MCUArray {
-		mcu := &header.MCUArray[a]
+	for a := range *header.MCUArray {
+		mcu := (&(*header.MCUArray)[a])
 		arr := mcu.getArraySections(header)
 		switch header.mcuDimensions {
 		case _8x8:
@@ -470,20 +587,20 @@ func inverseDCT(header *Header) {
 
 func dequantize(header *Header) {
 	for a := 0; a < header.mcuCount; a++ {
-		mcu := &(header.MCUArray)[a]
+		mcu := &(*header.MCUArray)[a]
 		switch header.mcuDimensions {
 		case _8x8:
-			tb := (*getQuantizationTable(header, 0)).table
+			tb := (*getQuantizationTable(header, 0))
 			for k := 0; k < 64; k++ {
-				(*mcu).ch1[k] *= int(tb[k])
+				(*mcu).ch1[k] *= int(tb.table[k])
 			}
-			tb = (*getQuantizationTable(header, 1)).table
+			tb = (*getQuantizationTable(header, 1))
 			for k := 0; k < 64; k++ {
-				(*mcu).ch2[k] *= int(tb[k])
+				(*mcu).ch2[k] *= int(tb.table[k])
 			}
-			tb = (*getQuantizationTable(header, 2)).table
+			tb = (*getQuantizationTable(header, 2))
 			for k := 0; k < 64; k++ {
-				(*mcu).ch3[k] *= int(tb[k])
+				(*mcu).ch3[k] *= int(tb.table[k])
 			}
 		case _16x8:
 			// Y1
@@ -587,36 +704,30 @@ func dequantize(header *Header) {
 	}
 }
 
+// Should only be used for first visit
 func decodeMCUCoeffecients(header *Header, br BitReader) {
 	prevDC := [3]int{0, 0, 0}
 	skips := 0
 	for a := 0; a < header.mcuCount; a++ {
 		// Get a new MCU Object with the correct dimensions
-		mcu := getMCU(header)
+		mcu := &(*header.MCUArray)[a]
 		switch header.mcuDimensions {
 		case _8x8:
-			for c := range header.cComponents {
+			for c := 0; c < 3; c++ {
 				comp := header.cComponents[c]
 				if comp.usedInScan {
 					acHuffmanTable := getTable(header, false, comp.acHuffmanTableId)
 					dcHuffmanTable := getTable(header, true, comp.dcHuffmanTableId)
-					coeff := read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, &prevDC[c], &skips)
+					var channel *[]int
 					switch c {
 					case 0:
-						for k := 0; k < 64; k++ {
-							(*mcu).ch1[zmap.Map1[k]] = coeff[k]
-						}
-
+						channel = &(*mcu).ch1
 					case 1:
-						for k := 0; k < 64; k++ {
-							(*mcu).ch2[zmap.Map1[k]] = coeff[k]
-						}
-
+						channel = &(*mcu).ch2
 					case 2:
-						for k := 0; k < 64; k++ {
-							(*mcu).ch3[zmap.Map1[k]] = coeff[k]
-						}
+						channel = &(*mcu).ch3
 					}
+					read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, &prevDC[c], &skips, channel)
 				}
 			}
 		case _16x8:
@@ -649,26 +760,7 @@ func decodeMCUCoeffecients(header *Header, br BitReader) {
 				case 3:
 					_prevDc = &prevDC[2]
 				}
-				coeff := read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDc, &skips)
-
-				switch c {
-				case 0:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch1[zmap.Map2[k]] = coeff[k]
-					}
-				case 1:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch1[zmap.Map2[k]+8] = coeff[k]
-					}
-				case 2:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch2[zmap.Map1[k]] = coeff[k]
-					}
-				case 3:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch3[zmap.Map1[k]] = coeff[k]
-					}
-				}
+				read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDc, &skips, nil)
 			}
 		case _8x16:
 			for c := 0; c < 4; c++ {
@@ -701,25 +793,7 @@ func decodeMCUCoeffecients(header *Header, br BitReader) {
 					_prevDC = &prevDC[2]
 
 				}
-				coeff := read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDC, &skips)
-				switch c {
-				case 0:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch1[zmap.Map1[k]] = coeff[k]
-					}
-				case 1:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch1[zmap.Map1[k]+64] = coeff[k]
-					}
-				case 2:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch2[zmap.Map1[k]] = coeff[k]
-					}
-				case 3:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch3[zmap.Map1[k]] = coeff[k]
-					}
-				}
+				read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDC, &skips, nil)
 			}
 		case _16x16:
 			for c := 0; c < 6; c++ {
@@ -761,37 +835,9 @@ func decodeMCUCoeffecients(header *Header, br BitReader) {
 				case 5:
 					_prevDC = &prevDC[2]
 				}
-				coeff := read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDC, &skips)
-				switch c {
-				case 0:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch1[zmap.Map2[k]] = coeff[k]
-					}
-				case 1:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch1[zmap.Map2[k]+8] = coeff[k]
-					}
-				case 2:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch1[zmap.Map2[k]+128] = coeff[k]
-					}
-				case 3:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch1[zmap.Map2[k]+128+8] = coeff[k]
-					}
-				case 4:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch2[zmap.Map2[k]] = coeff[k]
-					}
-				case 5:
-					for k := 0; k < 64; k++ {
-						(*mcu).ch3[zmap.Map2[k]] = coeff[k]
-					}
-				}
+				read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDC, &skips, nil)
 			}
 		}
-		// Add here
-		header.MCUArray = append(header.MCUArray, *mcu)
 	}
 }
 
@@ -867,11 +913,6 @@ func decodeDefineHuffmanTable(header *Header) {
 	}
 }
 
-func endScan(header *Header) {
-	buf := header.buffer
-	fmt.Printf("*** EOI (0xFF%X) ***\n", buf.bf[0])
-}
-
 // Helper function to print the scan information
 func printScanInfo(header *Header) {
 	fmt.Printf("*** SCAN ***\n")
@@ -896,7 +937,7 @@ func printScanInfo(header *Header) {
 				lastIndex := 0
 
 				for a := byte(0); a < 16; a++ {
-					fmt.Printf("%s -> ", pad(a))
+					fmt.Printf("%s -> ", pad(int(a)))
 					codesOfLen := tb.codesOfLen[int(a)]
 					for c := lastIndex; c < lastIndex+codesOfLen; c++ {
 						fmt.Printf("%x ", tb.symbols[c])
@@ -1012,9 +1053,10 @@ func decodeStartOfScan(header *Header) {
 	fmt.Printf("len(bitstream) = %d\n", len(_bitstream))
 	// Print the scan info
 	printScanInfo(header)
-	// Decode the MCU Coeffecients
+	// Decode the Coeffecients
 	decodeMCUCoeffecients(header, BitReader{data: &_bitstream})
 	// Continue reading the other markers
+
 	for {
 		if buf.bf[0] == 0xff {
 			buf.advance()
@@ -1034,6 +1076,10 @@ func decodeStartOfScan(header *Header) {
 			buf.advance()
 		}
 		if buf.bf[0] == EOI {
+			dequantize(header)
+			inverseDCT(header)
+			YCbCrToRGB(header)
+			writeBitMap(header)
 			fmt.Printf("*** Reached the end-of-image marker\n")
 			break
 		}
@@ -1150,7 +1196,7 @@ func YCbCrToRGB(header *Header) {
 	}
 
 	for a := 0; a < header.mcuCount; a++ {
-		mcu := &header.MCUArray[a]
+		mcu := (&(*header.MCUArray)[a])
 		for cf := 0; cf < mcuWidth*mcuHeight; cf++ {
 			cY := &(*mcu).ch1[cf]
 			cCb := &(*mcu).ch2[cf]
@@ -1198,9 +1244,10 @@ func generateCodes(tb *HuffmanTable) {
 	}
 }
 
+// Todo: Handle chroma subsampling
 func spreadMCU(header *Header) {
 	for a := 0; a < header.mcuCount; a++ {
-		mcu := &header.MCUArray[a]
+		mcu := (&(*header.MCUArray)[a])
 		arr := mcu.getArraySections(header)
 		switch header.mcuDimensions {
 		case _16x8:
@@ -1309,13 +1356,12 @@ func writeBitMap(header *Header) {
 			_pixelIndex := _mcuX + maxWidth*_mcuY
 			// Write the RGB Values
 			rgb := []byte{}
-			rgb = append(rgb, byte(header.MCUArray[_mcuIndex].ch3[_pixelIndex]))
-			rgb = append(rgb, byte(header.MCUArray[_mcuIndex].ch2[_pixelIndex]))
-			rgb = append(rgb, byte(header.MCUArray[_mcuIndex].ch1[_pixelIndex]))
+			rgb = append(rgb, byte((*header.MCUArray)[_mcuIndex].ch3[_pixelIndex]))
+			rgb = append(rgb, byte((*header.MCUArray)[_mcuIndex].ch2[_pixelIndex]))
+			rgb = append(rgb, byte((*header.MCUArray)[_mcuIndex].ch1[_pixelIndex]))
 			f.Write(rgb)
 		}
-		padding := []byte{}
-		padding = make([]byte, paddingSize)
+		padding := make([]byte, paddingSize)
 		f.Write(padding)
 	}
 	f.Close()
@@ -1323,8 +1369,7 @@ func writeBitMap(header *Header) {
 
 // Helper function to write a 4 byte integer in little endian
 func put4Int(a uint, f *os.File) {
-	data := []byte{}
-	data = make([]byte, 4)
+	data := make([]byte, 4)
 	data[0] = byte((a >> 0) & 0xFF)
 	data[1] = byte((a >> 8) & 0xFF)
 	data[2] = byte((a >> 16) & 0xFF)
@@ -1338,71 +1383,13 @@ func put4Int(a uint, f *os.File) {
 
 // Helper function to write a 2 byte integer in little endian
 func put2Int(a uint, f *os.File) {
-	data := []byte{}
-	data = make([]byte, 2)
+	data := make([]byte, 2)
 	data[0] = byte((a >> 0) & 0xFF)
 	data[1] = byte((a >> 8) & 0xFF)
 	_, err := f.Write(data)
 	if err != nil {
 		fmt.Printf("Error! %s\n", err.Error())
 		os.Exit(1)
-	}
-}
-
-func decodeChannelData(br *BitReader, channel *[64]int, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int) {
-	// Decode the DC coeffecient
-	sym := scanSymbol(br, dcHuffmanTable)
-	if sym == 0xFF {
-		fmt.Printf("Error! invalid DC Symbols\n")
-		os.Exit(1)
-	}
-	dcLength := int(sym)
-	// Since for DC length == sym
-	coeff := br.readBits(dcLength)
-	if dcLength != 0 && coeff < (1<<(dcLength-1)) {
-		coeff -= ((1 << dcLength) - 1)
-	}
-	coeff += *prevDC
-	*prevDC = coeff
-	(*channel)[0] = coeff
-	// Decode the AC Coeffecients
-	index := 1
-	for {
-		if index > 63 {
-			break
-		}
-		sym = scanSymbol(br, acHuffmanTable)
-		switch sym {
-		// The remaining coeffecients are all 0
-		case 0x00:
-			for a := index; a <= 63; a++ {
-				(*channel)[zigzag[a]] = 0
-				index++
-			}
-		// The next 16 coeffecients are all 0
-		case 0xF0:
-			max := index + 16
-			for a := index; a < max; a++ {
-				(*channel)[zigzag[a]] = 0
-				index++
-			}
-		// Decode the coeffLength and numZeros
-		default:
-			numZeros := sym >> 4
-			coeffLength := int(sym & 0x0F)
-			max := index + int(numZeros)
-			for a := index; a < max; a++ {
-				(*channel)[zigzag[a]] = 0
-				index++
-			}
-			// read the coeffecient
-			coeff := br.readBits(int(coeffLength))
-			if coeff < (1 << (coeffLength - 1)) {
-				coeff -= ((1 << coeffLength) - 1)
-			}
-			(*channel)[zigzag[index]] = coeff
-			index++
-		}
 	}
 }
 
@@ -1413,26 +1400,38 @@ type MCU struct {
 	ch3 []int
 }
 
-func getMCU(header *Header) *MCU {
+func getMCU(header *Header) MCU {
 	switch header.mcuDimensions {
 	case _8x8:
-		return &MCU{make([]int, 64), make([]int, 64), make([]int, 64)}
+		return MCU{make([]int, 64), make([]int, 64), make([]int, 64)}
 	case _8x16:
-		return &MCU{make([]int, 128), make([]int, 128), make([]int, 128)}
+		return MCU{make([]int, 128), make([]int, 128), make([]int, 128)}
 	case _16x8:
-		return &MCU{make([]int, 128), make([]int, 128), make([]int, 128)}
+		return MCU{make([]int, 128), make([]int, 128), make([]int, 128)}
 	case _16x16:
-		return &MCU{make([]int, 256), make([]int, 256), make([]int, 256)}
+		return MCU{make([]int, 256), make([]int, 256), make([]int, 256)}
 	}
-	return nil
+	return MCU{}
 }
 
+// // Helper function to get the array section as the data was originally without zmap
+// func (mcu *MCU) zArraySections(header *Header) [][64]int {
+// 	res := make([][64]int, 3)
+// 	// only for _8x8
+// 	for k := 0; k < 64; k++ {
+// 		res[0][k] = (*mcu).ch1[zmap.Map1[k]]
+// 		res[1][k] = (*mcu).ch1[zmap.Map1[k]]
+// 		res[2][k] = (*mcu).ch1[zmap.Map1[k]]
+// 	}
+// 	return res
+// }
+
 // Helper functions to get the [64]int from the MCU
+// this function gets the array section from the 'zmaped' coeffecients
 func (mcu *MCU) getArraySections(header *Header) [][64]int {
-	res := [][64]int{}
 	switch header.mcuDimensions {
 	case _8x8:
-		res = make([][64]int, 3)
+		res := make([][64]int, 3)
 		for k := 0; k < 64; k++ {
 			res[0][k] = (*mcu).ch1[k]
 			res[1][k] = (*mcu).ch2[k]
@@ -1440,7 +1439,7 @@ func (mcu *MCU) getArraySections(header *Header) [][64]int {
 		}
 		return res
 	case _16x8:
-		res = make([][64]int, 6)
+		res := make([][64]int, 6)
 		index := 0
 		for a := 0; a < 8; a++ {
 			base := 16 * a
@@ -1456,7 +1455,7 @@ func (mcu *MCU) getArraySections(header *Header) [][64]int {
 		}
 		return res
 	case _8x16:
-		res = make([][64]int, 6)
+		res := make([][64]int, 6)
 		for k := 0; k < 64; k++ {
 			res[0][k] = (*mcu).ch1[k]
 			res[1][k] = (*mcu).ch2[k]
@@ -1467,7 +1466,7 @@ func (mcu *MCU) getArraySections(header *Header) [][64]int {
 		}
 		return res
 	case _16x16:
-		res = make([][64]int, 12)
+		res := make([][64]int, 12)
 		index := 0
 		for a := 0; a < 8; a++ {
 			base := 16 * a
@@ -1498,6 +1497,7 @@ type BitReader struct {
 	nextBit  int
 }
 
+// Todo: Handle restart interval
 func (br *BitReader) align() {
 	if br.nextByte >= len(*br.data) {
 		return
@@ -1557,7 +1557,7 @@ func scanSymbol(br *BitReader, ht *HuffmanTable) byte {
 	return 0xFF
 }
 
-func pad(bt byte) string {
+func pad(bt int) string {
 	val := fmt.Sprintf("%d", int(bt))
 	rem := 3 - len(val)
 	for a := 0; a < rem; a++ {
@@ -1575,90 +1575,6 @@ var zigzag = [64]byte{
 	29, 22, 15, 23, 30, 37, 44, 51,
 	58, 59, 52, 45, 38, 31, 39, 46,
 	53, 60, 61, 54, 47, 55, 62, 63,
-}
-
-func (header *Header) print() {
-	fmt.Printf("\n")
-	fmt.Printf("Filename : [%s]\n", header.filename)
-	fmt.Printf("Filesize : [%d] Bytes\n", header.filesize)
-	fmt.Printf("\n")
-	fmt.Printf("Start Of Selection            : %d\n", header.startOfSelection)
-	fmt.Printf("End of Selection              : %d\n", header.endOfSelection)
-	fmt.Printf("Successive Approximation High : %d\n", header.successiveApproximationHigh)
-	fmt.Printf("Successive Approximation Low  : %d\n", header.successiveApproximationLow)
-	fmt.Printf("\n")
-	fmt.Printf("*** Quantization Tables ***\n")
-	for t := range header.qTables {
-		table := header.qTables[t]
-		fmt.Printf("Id (%d)\n", table.Id)
-		for entry := range table.table {
-			if entry%8 == 0 {
-				fmt.Printf("\n")
-			}
-			fmt.Printf("%s", pad(table.table[entry]))
-		}
-		fmt.Printf("\n\n")
-	}
-	fmt.Printf("*** Start Of Frame ***\n")
-	fmt.Printf("Size       : %d x %d\n", header.width, header.height)
-	fmt.Printf("Components : %d\n", len(header.cComponents))
-	for a := range header.cComponents {
-		comp := header.cComponents[a]
-		fmt.Printf("** ComponentId (%d) **\n", comp.Id)
-		fmt.Printf("Horizontal Sampling Factor : %d\n", comp.hSamplingFactor)
-		fmt.Printf("Vertical Sampling Factor   : %d\n", comp.vSamplingFactor)
-		fmt.Printf("Quantization Table Id      : %d\n", comp.qTableId)
-		fmt.Printf("AC Huffman Table Id        : %d\n", comp.acHuffmanTableId)
-		fmt.Printf("DC Huffman Table Id        : %d\n", comp.dcHuffmanTableId)
-	}
-	fmt.Printf("\n*** Huffman Tables ***\n")
-	for t := range header.huffmanTables {
-		table := header.huffmanTables[t]
-		fmt.Printf("* Id : (%d) ", table.Id)
-		if table.dc {
-			fmt.Printf("DC *\n")
-		} else {
-			fmt.Printf("AC *\n")
-		}
-		lastIndex := 0
-		for a := 0; a < 16; a++ {
-			fmt.Printf("%s  --> ", pad(byte(a+1)))
-			for s := range table.symbols[lastIndex : lastIndex+table.codesOfLen[a]] {
-				fmt.Printf("%x ", table.symbols[s+lastIndex])
-			}
-			lastIndex += table.codesOfLen[a]
-			fmt.Printf("\n")
-		}
-		fmt.Printf("\n")
-	}
-	fmt.Printf("Huffman data length (%d) Bytes\n", len(header.bitstream))
-
-	fmt.Printf("** MCU --> width: (%d) height: (%d) count:(%d)\n", header.mcuWidth, header.mcuHeight, header.mcuCount)
-	/**
-	fmt.Printf("\n***** Codes *****\n\n")
-	for t := range header.huffmanTables {
-		tb := header.huffmanTables[t]
-		var out bytes.Buffer
-		if tb.dc {
-			out.WriteString("* DC ")
-		} else {
-			out.WriteString("* AC ")
-		}
-		out.WriteString(fmt.Sprintf("Id #%d *\n", tb.Id))
-		lastIndex := 0
-		for a := 0; a < 16; a++ {
-			out.WriteString(fmt.Sprintf("Len #%d\n", a+1))
-			nCodes := tb.codesOfLen[a]
-			for k := lastIndex; k < lastIndex+nCodes; k++ {
-				out.WriteString(fmt.Sprintf("%b\n", tb.codes[k]))
-			}
-			lastIndex += nCodes
-			out.WriteString("\n")
-		}
-		out.WriteString("\n")
-		fmt.Printf(out.String())
-	}
-	**/
 }
 
 // Markers
@@ -1786,9 +1702,8 @@ type Header struct {
 	endOfSelection              byte
 	successiveApproximationHigh byte
 	successiveApproximationLow  byte
-	bitstream                   []byte
 	zeroBased                   bool
-	MCUArray                    []MCU
+	MCUArray                    *[]MCU
 	mcuWidth                    int
 	mcuHeight                   int
 	mcuDimensions               int
