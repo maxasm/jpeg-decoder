@@ -1040,9 +1040,10 @@ func decodeStartOfScan(header *Header) {
 				fmt.Printf("Invalid marker (0xFF%X) found in the bitsteam\n", buf.bf[0])
 				os.Exit(1)
 			}
+		} else {
+			_bitstream = append(_bitstream, buf.bf[0])
+			buf.advance()
 		}
-		_bitstream = append(_bitstream, buf.bf[0])
-		buf.advance()
 	}
 	// Generate huffman codes for all the huffman tables
 	for t := range header.huffmanTables {
