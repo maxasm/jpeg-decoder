@@ -199,19 +199,10 @@ func decodeStartOfFrame(h *Header) {
 
 }
 
-// for refinement you need the previous 64 coeffecients
-
-func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int, skips *int, channel *[]int, cIndex int) {
+func decodeBandCoeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int, skips *int, channel *[]int) {
 	// cmap for mapping coeffecients
-	var cmap map[int]int
-	switch header.mcuDimensions {
-	case _8x8:
-		cmap = zmap.Map1
-	case _16x8:
-		cmap = zmap.Map2
-	default:
-		cmap = zmap.Map1
-	}
+	var cmap map[int]int = zmap.Map1
+
 	// Progressive JPGs
 	if header.startOfSelection == 0 && header.successiveApproximationHigh == 0 {
 		/** DC First Visit **/
@@ -223,12 +214,7 @@ func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTa
 		}
 		dcCoeffecient += *prevDC
 		*prevDC = dcCoeffecient
-		// check if this is the Y component and if its the second Y in the scan
-		if cIndex == 1 && header.mcuDimensions == _16x8 {
-			(*channel)[cmap[0]+8] = dcCoeffecient << header.successiveApproximationLow
-		} else {
-			(*channel)[cmap[0]] = dcCoeffecient << header.successiveApproximationLow
-		}
+		(*channel)[cmap[0]] = dcCoeffecient << header.successiveApproximationLow
 	} else if header.startOfSelection != 0 && header.successiveApproximationHigh == 0 {
 		/** AC First Visit **/
 		if *skips > 0 {
@@ -254,11 +240,7 @@ func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTa
 				// 0xF0 means the next 16 coeffecients are 0
 				max := index + 16
 				for a := index; a < max; a++ {
-					if cIndex == 1 && header.mcuDimensions == _16x8 {
-						(*channel)[cmap[a]+8] = 0
-					} else {
-						(*channel)[cmap[a]] = 0
-					}
+					(*channel)[cmap[a]] = 0
 					index++
 				}
 			default:
@@ -267,22 +249,14 @@ func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTa
 				if acLength != 0 {
 					max := index + numZeros
 					for a := index; a < max; a++ {
-						if cIndex == 1 && header.mcuDimensions == _16x8 {
-							(*channel)[cmap[a]+8] = 0
-						} else {
-							(*channel)[cmap[a]] = 0
-						}
+						(*channel)[cmap[a]] = 0
 						index++
 					}
 					acCoeffecient := br.readBits(acLength)
 					if acCoeffecient < (1 << (acLength - 1)) {
 						acCoeffecient -= (1<<acLength - 1)
 					}
-					if cIndex == 1 && header.mcuDimensions == _16x8 {
-						(*channel)[cmap[index]+8] = acCoeffecient << int(header.successiveApproximationLow)
-					} else {
-						(*channel)[cmap[index]] = acCoeffecient << int(header.successiveApproximationLow)
-					}
+					(*channel)[cmap[index]] = acCoeffecient << int(header.successiveApproximationLow)
 					index++
 				} else {
 					_skips := (1 << numZeros) - 1
@@ -307,11 +281,7 @@ func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTa
 			fmt.Printf("Error! invalid DC refinment bit read\n")
 			os.Exit(1)
 		}
-		if cIndex == 1 && header.mcuDimensions == _16x8 {
-			(*channel)[cmap[0]+8] |= bit << header.successiveApproximationLow
-		} else {
-			(*channel)[cmap[0]] |= bit << header.successiveApproximationLow
-		}
+		(*channel)[cmap[0]] |= bit << header.successiveApproximationLow
 	} else if header.startOfSelection != 0 && header.successiveApproximationHigh != 0 {
 		// negative and positie bits
 		positive := 1 << header.successiveApproximationLow
@@ -362,11 +332,7 @@ func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTa
 				// Handle the zeroes
 				for {
 					var currCoeff *int
-					if cIndex == 1 && header.mcuDimensions == _16x8 {
-						currCoeff = &((*channel)[cmap[index]+8])
-					} else {
-						currCoeff = &((*channel)[cmap[index]])
-					}
+					currCoeff = &((*channel)[cmap[index]])
 					// read a new bit for every non-zero coeffecient
 					if *currCoeff != 0 {
 						bit := br.readBit()
@@ -390,11 +356,7 @@ func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTa
 					}
 					index += 1
 				}
-				if cIndex == 1 && header.mcuDimensions == _16x8 {
-					(*channel)[cmap[index]+8] = coeff
-				} else {
-					(*channel)[cmap[index]] = coeff
-				}
+				(*channel)[cmap[index]] = coeff
 				index += 1
 			}
 		}
@@ -405,11 +367,7 @@ func read64Coeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTa
 					break
 				}
 				var currCoeff *int
-				if cIndex == 1 && header.mcuDimensions == _16x8 {
-					currCoeff = &((*channel)[cmap[index]+8])
-				} else {
-					currCoeff = &(*channel)[cmap[index]]
-				}
+				currCoeff = &(*channel)[cmap[index]]
 				// read a new bit for every non-zero coeffeceint
 				if *currCoeff != 0 {
 					bit := br.readBit()
@@ -747,156 +705,36 @@ func dequantize(header *Header) {
 	}
 }
 
-// Should only be used for first visit
-// decode the MCU Coeffecients after every scan
-func decodeMCUCoeffecients(header *Header, br BitReader) {
+/**
+func decodeHuffmanData(header *Header, br BitReader) {
 	prevDC := [3]int{0, 0, 0}
 	skips := 0
 	for a := 0; a < header.mcuCount; a++ {
 		// Get a new MCU Object with the correct dimensions
 		mcu := &(*header.MCUArray)[a]
-		switch header.mcuDimensions {
-		case _8x8:
-			for c := 0; c < 3; c++ {
-				comp := header.cComponents[c]
-				if comp.usedInScan {
-					acHuffmanTable := getTable(header, false, comp.acHuffmanTableId)
-					dcHuffmanTable := getTable(header, true, comp.dcHuffmanTableId)
-					var channel *[]int
-					switch c {
-					case 0:
-						channel = &(*mcu).ch1
-					case 1:
-						channel = &(*mcu).ch2
-					case 2:
-						channel = &(*mcu).ch3
-					}
-					read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, &prevDC[c], &skips, channel, c)
-				}
-			}
-		case _16x8:
-			for c := 0; c < 4; c++ {
-				// check if the component is used in the scan
-				compIndex := c
+		for c := 0; c < 3; c++ {
+			comp := header.cComponents[c]
+			if comp.usedInScan {
+				acHuffmanTable := getTable(header, false, comp.acHuffmanTableId)
+				dcHuffmanTable := getTable(header, true, comp.dcHuffmanTableId)
+				var channel *[]int
 				switch c {
 				case 0:
-					compIndex = 0
+					channel = &(*mcu).ch1
 				case 1:
-					compIndex = 0
+					channel = &(*mcu).ch2
 				case 2:
-					compIndex = 1
-				case 3:
-					compIndex = 2
+					channel = &(*mcu).ch3
 				}
-				comp := header.cComponents[compIndex]
-				if comp.usedInScan {
-					var acHuffmanTable *HuffmanTable
-					var dcHuffmanTable *HuffmanTable
-					var channel *[]int
-					var _prevDc *int
-					switch c {
-					case 0:
-						acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
-						dcHuffmanTable = getTable(header, true, header.cComponents[0].dcHuffmanTableId)
-						channel = &(*mcu).ch1
-						_prevDc = &prevDC[0]
-					case 1:
-						acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
-						dcHuffmanTable = getTable(header, true, header.cComponents[0].dcHuffmanTableId)
-						channel = &(*mcu).ch1
-						_prevDc = &prevDC[0]
-					case 2:
-						acHuffmanTable = getTable(header, false, header.cComponents[1].acHuffmanTableId)
-						dcHuffmanTable = getTable(header, true, header.cComponents[1].dcHuffmanTableId)
-						channel = &(*mcu).ch2
-						_prevDc = &prevDC[1]
-					case 3:
-						acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
-						dcHuffmanTable = getTable(header, true, header.cComponents[2].dcHuffmanTableId)
-						channel = &(*mcu).ch3
-						_prevDc = &prevDC[2]
-					}
-					read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDc, &skips, channel, c)
-				}
-			}
-
-		case _8x16:
-			for c := 0; c < 4; c++ {
-				// Y(0) Y(1) Cb Cr
-				var acHuffmanTable *HuffmanTable
-				var dcHuffmanTable *HuffmanTable
-				switch c {
-				case 0:
-					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[0].dcHuffmanTableId)
-				case 1:
-					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[0].dcHuffmanTableId)
-				case 2:
-					acHuffmanTable = getTable(header, false, header.cComponents[1].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[1].dcHuffmanTableId)
-				case 3:
-					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[2].dcHuffmanTableId)
-				}
-				var _prevDC *int
-				switch c {
-				case 0:
-					_prevDC = &prevDC[0]
-				case 1:
-					_prevDC = &prevDC[0]
-				case 2:
-					_prevDC = &prevDC[1]
-				case 3:
-					_prevDC = &prevDC[2]
-
-				}
-				read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDC, &skips, nil, c)
-			}
-		case _16x16:
-			for c := 0; c < 6; c++ {
-				// Y(0) Y(1) Y(2) Y(3) Cb Cr
-				var acHuffmanTable *HuffmanTable
-				var dcHuffmanTable *HuffmanTable
-				switch c {
-				case 0:
-					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[0].dcHuffmanTableId)
-				case 1:
-					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[0].dcHuffmanTableId)
-				case 2:
-					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[0].dcHuffmanTableId)
-				case 3:
-					acHuffmanTable = getTable(header, false, header.cComponents[0].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[0].dcHuffmanTableId)
-				case 4:
-					acHuffmanTable = getTable(header, false, header.cComponents[1].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[1].dcHuffmanTableId)
-				case 5:
-					acHuffmanTable = getTable(header, false, header.cComponents[2].acHuffmanTableId)
-					dcHuffmanTable = getTable(header, true, header.cComponents[2].dcHuffmanTableId)
-				}
-				var _prevDC *int
-				switch c {
-				case 0:
-					_prevDC = &prevDC[0]
-				case 1:
-					_prevDC = &prevDC[0]
-				case 2:
-					_prevDC = &prevDC[0]
-				case 3:
-					_prevDC = &prevDC[0]
-				case 4:
-					_prevDC = &prevDC[1]
-				case 5:
-					_prevDC = &prevDC[2]
-				}
-				read64Coeffecients(header, &br, acHuffmanTable, dcHuffmanTable, _prevDC, &skips, nil, c)
+				decodeBandCoeffecients(header, &br, acHuffmanTable, dcHuffmanTable, &prevDC[c], &skips, channel)
 			}
 		}
 	}
+}
+**/
+
+func decodeHuffmanData(header *Header, br *BitReader) {
+
 }
 
 func decodeDefineRestartInterval(header *Header) {
@@ -1113,7 +951,7 @@ func decodeStartOfScan(header *Header) {
 	// Print the scan info
 	printScanInfo(header)
 	// Decode the Coeffecients
-	decodeMCUCoeffecients(header, BitReader{data: &_bitstream})
+	decodeHuffmanData(header, &BitReader{data: &_bitstream})
 	// Continue reading the other markers
 
 	for {
