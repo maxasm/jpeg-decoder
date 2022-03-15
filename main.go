@@ -6,7 +6,6 @@ import (
 	"math"
 	"os"
 	"path"
-	"strings"
 )
 
 type Buffer struct {
@@ -156,42 +155,22 @@ func decodeStartOfFrame(h *Header) {
 		}
 	}
 
+	// blocks
+	h.blockWidth = (h.width + 7) / 8
+	h.blockHeight = (h.height + 7) / 8
+	h.blockWidthReal = h.blockWidth
+	h.blockHeightReal = h.blockHeight
+	// the luminance channel determines the MCU dimensions
 	comp := h.cComponents[0]
-	// Check the scling factor of the Y channel and set the mcuWidth and Height
-	if comp.hSamplingFactor == 1 {
-		if comp.vSamplingFactor == 1 {
-			h.mcuDimensions = _8x8
-			h.mcuWidth = (h.width + 7) / 8
-			h.mcuHeight = (h.height + 7) / 8
-		} else if comp.vSamplingFactor == 2 {
-			h.mcuDimensions = _8x16
-			h.mcuWidth = (h.width + 7) / 8
-			h.mcuHeight = (h.height + 15) / 16
-		} else {
-			fmt.Printf("Error! Invalid Sampling Factor\n")
-		}
-	} else if comp.hSamplingFactor == 2 {
-		if comp.vSamplingFactor == 1 {
-			h.mcuDimensions = _16x8
-			h.mcuWidth = (h.width + 15) / 16
-			h.mcuHeight = (h.height + 7) / 8
-		} else if comp.vSamplingFactor == 2 {
-			h.mcuDimensions = _16x16
-			h.mcuHeight = (h.height + 15) / 16
-			h.mcuWidth = (h.width + 15) / 16
-		} else {
-			fmt.Printf("Error! invalid Sampling Factor\n")
-		}
-	} else {
-		fmt.Printf("Error! invalid Sampling Factor\n")
+	if comp.vSamplingFactor == 2 && h.blockHeight%2 == 1 {
+		h.blockHeightReal += 1
 	}
-	h.mcuCount = h.mcuWidth * h.mcuHeight
-	_arr := make([]MCU, h.mcuCount)
-	h.MCUArray = &_arr
-	// Create all the mcus needed for the image
-	for m := 0; m < h.mcuCount; m++ {
-		(*h.MCUArray)[m] = getMCU(h)
+	if comp.hSamplingFactor == 2 && h.blockWidth%2 == 1 {
+		h.blockWidthReal += 1
 	}
+	h.blockCount = h.blockHeightReal * h.blockWidthReal
+	_arr := make([]Block, h.blockCount)
+	h.blocks = &_arr
 	// Check if len == 0
 	if length != 0 {
 		fmt.Printf("Error! Invalid Start Of Frame\n")
@@ -199,7 +178,7 @@ func decodeStartOfFrame(h *Header) {
 
 }
 
-func decodeBandCoeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int, skips *int, channel *[]int) {
+func decodeBandCoeffecients(header *Header, br *BitReader, acHuffmanTable *HuffmanTable, dcHuffmanTable *HuffmanTable, prevDC *int, skips *int, channel *[64]int) {
 	// cmap for mapping coeffecients
 	var cmap map[int]int = zmap.Map1
 
@@ -440,301 +419,73 @@ func inverseDCTPixel(x int, y int, channel *[64]int) int {
 	return int(sum * 0.25)
 }
 
-func inverseDCT(header *Header) {
-	for a := range *header.MCUArray {
-		mcu := (&(*header.MCUArray)[a])
-		arr := mcu.getArraySections(header)
-		switch header.mcuDimensions {
-		case _8x8:
-			arr1 := [64]int{}
-			arr2 := [64]int{}
-			arr3 := [64]int{}
-
-			for y := 0; y < 8; y++ {
-				for x := 0; x < 8; x++ {
-					arr1[x+8*y] = inverseDCTPixel(x, y, &arr[0])
-					arr2[x+8*y] = inverseDCTPixel(x, y, &arr[1])
-					arr3[x+8*y] = inverseDCTPixel(x, y, &arr[2])
-				}
-			}
-
-			// reset the values
-			index := 0
-			for k := 0; k < 8; k++ {
-				base := 8 * k
-				for j := base; j < base+8; j++ {
-					(*mcu).ch1[j] = arr1[index]
-					(*mcu).ch2[j] = arr2[index]
-					(*mcu).ch3[j] = arr3[index]
-					index++
-				}
-			}
-		case _16x8:
-			arr1 := [64]int{}
-			arr2 := [64]int{}
-			arr3 := [64]int{}
-			arr4 := [64]int{}
-			arr5 := [64]int{}
-			arr6 := [64]int{}
-
-			for y := 0; y < 8; y++ {
-				for x := 0; x < 8; x++ {
-					arr1[x+y*8] = inverseDCTPixel(x, y, &arr[0])
-					arr2[x+y*8] = inverseDCTPixel(x, y, &arr[1])
-					arr3[x+y*8] = inverseDCTPixel(x, y, &arr[2])
-					arr4[x+y*8] = inverseDCTPixel(x, y, &arr[3])
-					arr5[x+y*8] = inverseDCTPixel(x, y, &arr[4])
-					arr6[x+y*8] = inverseDCTPixel(x, y, &arr[5])
-				}
-			}
-
-			// Reset the values
-			index := 0
-			for k := 0; k < 8; k++ {
-				base := 16 * k
-				for j := base; j < base+8; j++ {
-					(*mcu).ch1[j] = arr1[index]
-					(*mcu).ch2[j] = arr2[index]
-					(*mcu).ch3[j] = arr3[index]
-					(*mcu).ch1[j+8] = arr4[index]
-					(*mcu).ch2[j+8] = arr4[index]
-					(*mcu).ch3[j+8] = arr6[index]
-					index++
-				}
-			}
-		case _8x16:
-			arr1 := [64]int{}
-			arr2 := [64]int{}
-			arr3 := [64]int{}
-			arr4 := [64]int{}
-			arr5 := [64]int{}
-			arr6 := [64]int{}
-
-			for y := 0; y < 8; y++ {
-				for x := 0; x < 8; x++ {
-					arr1[x+8*y] = inverseDCTPixel(x, y, &arr[0])
-					arr2[x+8*y] = inverseDCTPixel(x, y, &arr[1])
-					arr3[x+8*y] = inverseDCTPixel(x, y, &arr[2])
-					arr4[x+8*y] = inverseDCTPixel(x, y, &arr[3])
-					arr5[x+8*y] = inverseDCTPixel(x, y, &arr[4])
-					arr6[x+8*y] = inverseDCTPixel(x, y, &arr[5])
-				}
-			}
-
-			// Reset the values
-			for k := 0; k < 64; k++ {
-				(*mcu).ch1[k] = arr1[k]
-				(*mcu).ch2[k] = arr2[k]
-				(*mcu).ch3[k] = arr3[k]
-				(*mcu).ch1[k+64] = arr4[k]
-				(*mcu).ch2[k+64] = arr5[k]
-				(*mcu).ch3[k+64] = arr6[k]
-			}
-		case _16x16:
-			arr1 := [64]int{}
-			arr2 := [64]int{}
-			arr3 := [64]int{}
-			arr4 := [64]int{}
-			arr5 := [64]int{}
-			arr6 := [64]int{}
-			arr7 := [64]int{}
-			arr8 := [64]int{}
-			arr9 := [64]int{}
-			arr10 := [64]int{}
-			arr11 := [64]int{}
-			arr12 := [64]int{}
-
-			for y := 0; y < 8; y++ {
-				for x := 0; x < 8; x++ {
-					arr1[x+8*y] = inverseDCTPixel(x, y, &arr[0])
-					arr2[x+8*y] = inverseDCTPixel(x, y, &arr[1])
-					arr3[x+8*y] = inverseDCTPixel(x, y, &arr[2])
-					arr4[x+8*y] = inverseDCTPixel(x, y, &arr[3])
-					arr5[x+8*y] = inverseDCTPixel(x, y, &arr[4])
-					arr6[x+8*y] = inverseDCTPixel(x, y, &arr[5])
-					arr7[x+8*y] = inverseDCTPixel(x, y, &arr[6])
-					arr8[x+8*y] = inverseDCTPixel(x, y, &arr[7])
-					arr9[x+8*y] = inverseDCTPixel(x, y, &arr[8])
-					arr10[x+8*y] = inverseDCTPixel(x, y, &arr[9])
-					arr11[x+8*y] = inverseDCTPixel(x, y, &arr[10])
-					arr12[x+8*y] = inverseDCTPixel(x, y, &arr[11])
-				}
-			}
-
-			// Reset the values
-			index := 0
-			for k := 0; k < 8; k++ {
-				base := 16 * k
-				for j := base; j < base+8; j++ {
-					(*mcu).ch1[j] = arr1[index]
-					(*mcu).ch2[j] = arr2[index]
-					(*mcu).ch3[j] = arr3[index]
-					(*mcu).ch1[j+8] = arr4[index]
-					(*mcu).ch2[j+8] = arr5[index]
-					(*mcu).ch3[j+8] = arr6[index]
-					(*mcu).ch1[j+128] = arr7[index]
-					(*mcu).ch2[j+128] = arr8[index]
-					(*mcu).ch3[j+128] = arr9[index]
-					(*mcu).ch1[j+128+8] = arr10[index]
-					(*mcu).ch2[j+128+8] = arr11[index]
-					(*mcu).ch3[j+128+8] = arr12[index]
-					index++
-				}
-			}
-		}
-
-	}
-}
-
-func dequantize(header *Header) {
-	for a := 0; a < header.mcuCount; a++ {
-		mcu := &(*header.MCUArray)[a]
-		switch header.mcuDimensions {
-		case _8x8:
-			tb := (*getQuantizationTable(header, 0))
-			for k := 0; k < 64; k++ {
-				(*mcu).ch1[k] *= int(tb.table[k])
-			}
-			tb = (*getQuantizationTable(header, 1))
-			for k := 0; k < 64; k++ {
-				(*mcu).ch2[k] *= int(tb.table[k])
-			}
-			tb = (*getQuantizationTable(header, 2))
-			for k := 0; k < 64; k++ {
-				(*mcu).ch3[k] *= int(tb.table[k])
-			}
-		case _16x8:
-			// Y1
-			tb := (*getQuantizationTable(header, 0)).table
-			index := 0
-			for k := 0; k < 8; k++ {
-				base := 16 * k
-				for j := base; j < base+8; j++ {
-					(*mcu).ch1[j] *= int(tb[index])
-					index++
-				}
-			}
-			// Y2
-			index = 0
-			for k := 0; k < 8; k++ {
-				base := 16*k + 8
-				for j := base; j < base+8; j++ {
-					(*mcu).ch1[j] *= int(tb[index])
-					index++
-				}
-			}
-			// Cb
-			tb = (*getQuantizationTable(header, 1)).table
-			for k := 0; k < 64; k++ {
-				(*mcu).ch2[k] *= int(tb[k])
-			}
-			// Cr
-			tb = (*getQuantizationTable(header, 2)).table
-			for k := 0; k < 64; k++ {
-				(*mcu).ch3[k] *= int(tb[k])
-			}
-		case _8x16:
-			// Y1
-			tb := (*getQuantizationTable(header, 0)).table
-			for k := 0; k < 64; k++ {
-				(*mcu).ch1[k] *= int(tb[k])
-			}
-			// Y2
-			for k := 64; k < 128; k++ {
-				(*mcu).ch1[k] *= int(tb[k-64])
-			}
-			// Cb
-			tb = (*getQuantizationTable(header, 1)).table
-			for k := 0; k < 64; k++ {
-				(*mcu).ch2[k] *= int(tb[k])
-			}
-			// Cr
-			tb = (*getQuantizationTable(header, 2)).table
-			for k := 0; k < 64; k++ {
-				(*mcu).ch3[k] *= int(tb[k])
-			}
-		case _16x16:
-			// Y1
-			tb := (*getQuantizationTable(header, 0)).table
-			index := 0
-			for k := 0; k < 8; k++ {
-				base := 16 * k
-				for j := base; j < base+8; j++ {
-					(*mcu).ch1[j] *= int(tb[index])
-					index++
-				}
-			}
-			// Y2
-			index = 0
-			for k := 0; k < 8; k++ {
-				base := 16*k + 8
-				for j := base; j < base+8; j++ {
-					(*mcu).ch1[j] *= int(tb[index])
-					index++
-				}
-			}
-			// Y3
-			index = 0
-			for k := 8; k < 16; k++ {
-				base := 16 * k
-				for j := base; j < base+8; j++ {
-					(*mcu).ch1[j] *= int(tb[index])
-					index++
-				}
-			}
-			// Y4
-			index = 0
-			for k := 8; k < 16; k++ {
-				base := 16*k + 8
-				for j := base; j < base+8; j++ {
-					(*mcu).ch1[j] *= int(tb[index])
-					index++
-				}
-			}
-			// Cb
-			tb = (*getQuantizationTable(header, 1)).table
-			for k := 0; k < 64; k++ {
-				(*mcu).ch2[k] *= int(tb[k])
-			}
-			// Cr
-			tb = (*getQuantizationTable(header, 2)).table
-			for k := 0; k < 64; k++ {
-				(*mcu).ch3[k] *= int(tb[k])
-			}
-		}
-	}
-}
-
-/**
-func decodeHuffmanData(header *Header, br BitReader) {
-	prevDC := [3]int{0, 0, 0}
+func decodeHuffmanData(header *Header, br *BitReader) {
+	prevDC := [3]int{}
 	skips := 0
-	for a := 0; a < header.mcuCount; a++ {
-		// Get a new MCU Object with the correct dimensions
-		mcu := &(*header.MCUArray)[a]
-		for c := 0; c < 3; c++ {
-			comp := header.cComponents[c]
-			if comp.usedInScan {
+
+	luminanceOnlyScan := false
+	if header.componentsInScan == 1 && header.cComponents[0].usedInScan {
+		luminanceOnlyScan = true
+	}
+
+	var xStep int
+	var yStep int
+
+	if luminanceOnlyScan {
+		xStep = 1
+		yStep = 1
+	} else {
+		xStep = header.cComponents[0].hSamplingFactor
+		yStep = header.cComponents[0].vSamplingFactor
+	}
+
+	for y := 0; y < header.blockHeight; y += yStep {
+		for x := 0; x < header.blockWidth; x += xStep {
+			for cp := range header.cComponents {
+				comp := header.cComponents[cp]
 				acHuffmanTable := getTable(header, false, comp.acHuffmanTableId)
 				dcHuffmanTable := getTable(header, true, comp.dcHuffmanTableId)
-				var channel *[]int
-				switch c {
-				case 0:
-					channel = &(*mcu).ch1
-				case 1:
-					channel = &(*mcu).ch2
-				case 2:
-					channel = &(*mcu).ch3
+				if comp.usedInScan {
+					var xMax int
+					var yMax int
+					if luminanceOnlyScan {
+						yMax = 1
+						xMax = 1
+					} else {
+						yMax = comp.vSamplingFactor
+						xMax = comp.hSamplingFactor
+					}
+					for u := 0; u < yMax; u++ {
+						for v := 0; v < xMax; v++ {
+							blockIndex := (x + v) + (y+u)*header.blockWidthReal
+							block := &(*header.blocks)[blockIndex]
+							var chann *[64]int
+							switch cp {
+							case 0:
+								chann = &(*block).ch1
+							case 1:
+								chann = &(*block).ch2
+							case 2:
+								chann = &(*block).ch3
+							default:
+								chann = nil
+							}
+							// decode the coeffecients in the band
+							decodeBandCoeffecients(
+								header,
+								br,
+								acHuffmanTable,
+								dcHuffmanTable,
+								&prevDC[cp],
+								&skips,
+								chann,
+							)
+						}
+					}
 				}
-				decodeBandCoeffecients(header, &br, acHuffmanTable, dcHuffmanTable, &prevDC[c], &skips, channel)
 			}
 		}
 	}
-}
-**/
-
-func decodeHuffmanData(header *Header, br *BitReader) {
-
 }
 
 func decodeDefineRestartInterval(header *Header) {
@@ -973,11 +724,6 @@ func decodeStartOfScan(header *Header) {
 			buf.advance()
 		}
 		if buf.bf[0] == EOI {
-			dequantize(header)
-			inverseDCT(header)
-			spreadMCU(header)
-			YCbCrToRGB(header)
-			writeBitMap(header)
 			fmt.Printf("*** Reached the end-of-image marker\n")
 			break
 		}
@@ -1075,58 +821,6 @@ func decodeJPEG(filename string) {
 	file.Close()
 }
 
-func YCbCrToRGB(header *Header) {
-	mcuWidth := 0
-	mcuHeight := 0
-	switch header.mcuDimensions {
-	case _8x8:
-		mcuWidth = 8
-		mcuHeight = 8
-	case _16x8:
-		mcuWidth = 16
-		mcuHeight = 8
-	case _8x16:
-		mcuWidth = 8
-		mcuHeight = 16
-	case _16x16:
-		mcuWidth = 16
-		mcuHeight = 16
-	}
-
-	for a := 0; a < header.mcuCount; a++ {
-		mcu := (&(*header.MCUArray)[a])
-		for cf := 0; cf < mcuWidth*mcuHeight; cf++ {
-			cY := &(*mcu).ch1[cf]
-			cCb := &(*mcu).ch2[cf]
-			cCr := &(*mcu).ch3[cf]
-			cR := float32((*cY)) + (1.402 * (float32(*cCr))) + 128
-			cG := float32((*cY)) - (0.344 * (float32(*cCb))) - (0.714 * float32((*cCr))) + 128
-			cB := float32((*cY)) + (1.772 * (float32(*cCb))) + 128
-			if cR < 0 {
-				cR = 0
-			}
-			if cR > 255 {
-				cR = 255
-			}
-			if cB < 0 {
-				cB = 0
-			}
-			if cB > 255 {
-				cB = 255
-			}
-			if cG < 0 {
-				cG = 0
-			}
-			if cG > 255 {
-				cG = 255
-			}
-			*cY = int(cR)
-			*cCb = int(cG)
-			*cCr = int(cB)
-		}
-	}
-}
-
 func generateCodes(tb *HuffmanTable) {
 	// Iterate through all the lenghts
 	code := 0
@@ -1142,60 +836,7 @@ func generateCodes(tb *HuffmanTable) {
 	}
 }
 
-// Todo: Handle chroma subsampling
-func spreadMCU(header *Header) {
-	for a := 0; a < header.mcuCount; a++ {
-		mcu := (&(*header.MCUArray)[a])
-		arr := mcu.getArraySections(header)
-		switch header.mcuDimensions {
-		case _16x8:
-			for k := 0; k < 64; k++ {
-				// Cb
-				(*mcu).ch2[2*k] = arr[1][k]
-				(*mcu).ch2[2*k+1] = arr[1][k]
-				// Cr
-				(*mcu).ch3[2*k] = arr[2][k]
-				(*mcu).ch3[2*k+1] = arr[2][k]
-			}
-		case _8x16:
-			index := 0
-			for k := 0; k < 8; k++ {
-				base := 16 * k
-				for j := base; j < base+8; j++ {
-					// Cb
-					(*mcu).ch2[j] = arr[1][index]
-					(*mcu).ch2[j+8] = arr[1][index]
-					// Cr
-					(*mcu).ch3[j] = arr[2][index]
-					(*mcu).ch3[j+8] = arr[2][index]
-					index++
-				}
-			}
-		case _16x16:
-			// Handle vertical
-			index := 0
-			for k := 0; k < 8; k++ {
-				base := 32 * k
-				for b := base; b < base+16; b++ {
-					if b%2 == 0 {
-						// Cb
-						(*mcu).ch2[b] = arr[1][index]
-						(*mcu).ch2[b+16] = arr[1][index]
-						(*mcu).ch2[b+1] = arr[1][index]
-						(*mcu).ch2[b+16+1] = arr[1][index]
-						// Cr
-						(*mcu).ch3[b] = arr[2][index]
-						(*mcu).ch3[b+16] = arr[2][index]
-						(*mcu).ch3[b+1] = arr[2][index]
-						(*mcu).ch3[b+16+1] = arr[2][index]
-						index++
-					}
-				}
-			}
-		}
-	}
-}
-
+/**
 func writeBitMap(header *Header) {
 	paddingSize := header.width % 4
 	// The total size
@@ -1265,6 +906,7 @@ func writeBitMap(header *Header) {
 	f.Close()
 }
 
+**/
 // Helper function to write a 4 byte integer in little endian
 func put4Int(a uint, f *os.File) {
 	data := make([]byte, 4)
@@ -1291,102 +933,10 @@ func put2Int(a uint, f *os.File) {
 	}
 }
 
-// An MCU is a 1d array whose size depends on the scaling factor
-type MCU struct {
-	ch1 []int
-	ch2 []int
-	ch3 []int
-}
-
-func getMCU(header *Header) MCU {
-	switch header.mcuDimensions {
-	case _8x8:
-		return MCU{make([]int, 64), make([]int, 64), make([]int, 64)}
-	case _8x16:
-		return MCU{make([]int, 128), make([]int, 128), make([]int, 128)}
-	case _16x8:
-		return MCU{make([]int, 128), make([]int, 128), make([]int, 128)}
-	case _16x16:
-		return MCU{make([]int, 256), make([]int, 256), make([]int, 256)}
-	}
-	return MCU{}
-}
-
-// // Helper function to get the array section as the data was originally without zmap
-// func (mcu *MCU) zArraySections(header *Header) [][64]int {
-// 	res := make([][64]int, 3)
-// 	// only for _8x8
-// 	for k := 0; k < 64; k++ {
-// 		res[0][k] = (*mcu).ch1[zmap.Map1[k]]
-// 		res[1][k] = (*mcu).ch1[zmap.Map1[k]]
-// 		res[2][k] = (*mcu).ch1[zmap.Map1[k]]
-// 	}
-// 	return res
-// }
-
-// Helper functions to get the [64]int from the MCU
-// this function gets the array section from the 'zmaped' coeffecients
-func (mcu *MCU) getArraySections(header *Header) [][64]int {
-	switch header.mcuDimensions {
-	case _8x8:
-		res := make([][64]int, 3)
-		for k := 0; k < 64; k++ {
-			res[0][k] = (*mcu).ch1[k]
-			res[1][k] = (*mcu).ch2[k]
-			res[2][k] = (*mcu).ch3[k]
-		}
-		return res
-	case _16x8:
-		res := make([][64]int, 6)
-		index := 0
-		for a := 0; a < 8; a++ {
-			base := 16 * a
-			for k := base; k < base+8; k++ {
-				res[0][index] = (*mcu).ch1[k]
-				res[1][index] = (*mcu).ch2[k]
-				res[2][index] = (*mcu).ch3[k]
-				res[3][index] = (*mcu).ch1[k+8]
-				res[4][index] = (*mcu).ch2[k+8]
-				res[5][index] = (*mcu).ch3[k+8]
-				index++
-			}
-		}
-		return res
-	case _8x16:
-		res := make([][64]int, 6)
-		for k := 0; k < 64; k++ {
-			res[0][k] = (*mcu).ch1[k]
-			res[1][k] = (*mcu).ch2[k]
-			res[2][k] = (*mcu).ch3[k]
-			res[3][k] = (*mcu).ch1[k+64]
-			res[4][k] = (*mcu).ch2[k+64]
-			res[5][k] = (*mcu).ch3[k+64]
-		}
-		return res
-	case _16x16:
-		res := make([][64]int, 12)
-		index := 0
-		for a := 0; a < 8; a++ {
-			base := 16 * a
-			for k := base; k < base+8; k++ {
-				res[0][index] = (*mcu).ch1[k]
-				res[1][index] = (*mcu).ch2[k]
-				res[2][index] = (*mcu).ch3[k]
-				res[3][index] = (*mcu).ch1[k+8]
-				res[4][index] = (*mcu).ch2[k+8]
-				res[5][index] = (*mcu).ch3[k+8]
-				res[6][index] = (*mcu).ch1[k+128]
-				res[7][index] = (*mcu).ch2[k+128]
-				res[8][index] = (*mcu).ch3[k+128]
-				res[9][index] = (*mcu).ch1[k+128+8]
-				res[10][index] = (*mcu).ch2[k+128+8]
-				res[11][index] = (*mcu).ch3[k+128+8]
-				index++
-			}
-		}
-		return res
-	}
-	return nil
+type Block struct {
+	ch1 [64]int
+	ch2 [64]int
+	ch3 [64]int
 }
 
 type BitReader struct {
@@ -1601,13 +1151,15 @@ type Header struct {
 	successiveApproximationHigh byte
 	successiveApproximationLow  byte
 	zeroBased                   bool
-	MCUArray                    *[]MCU
-	mcuWidth                    int
-	mcuHeight                   int
-	mcuDimensions               int
-	mcuCount                    int
 	componentsInScan            int  // The numnber of components used in the scan
 	frameType                   byte // SOF0 or SOF2
+	/**/
+	blocks          *[]Block
+	blockWidth      int
+	blockHeight     int
+	blockWidthReal  int
+	blockHeightReal int
+	blockCount      int
 }
 
 type ColorComponent struct {
