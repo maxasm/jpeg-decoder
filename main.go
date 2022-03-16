@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path"
+	"strings"
 )
 
 type Buffer struct {
@@ -382,8 +383,8 @@ func getTable(header *Header, dc bool, Id int) *HuffmanTable {
 }
 
 // Helper function to get the correct quantization table
-func getQuantizationTable(header *Header, index int) *QuantizationTable {
-	tId := header.cComponents[index].qTableId
+func getQuantizationTable(header *Header, compIndex int) *QuantizationTable {
+	tId := header.cComponents[compIndex].qTableId
 	for a := range header.qTables {
 		t := header.qTables[a]
 		if t.Id == tId {
@@ -419,8 +420,155 @@ func inverseDCTPixel(x int, y int, channel *[64]int) int {
 	return int(sum * 0.25)
 }
 
+// Inverse DCT
+func inverseDCT(header *Header) {
+	for y := 0; y < header.blockHeightReal; y++ {
+		for x := 0; x < header.blockWidthReal; x++ {
+			blockIndex := x + y*header.blockWidthReal
+			block := &(*header.blocks)[blockIndex]
+			for cp := range header.cComponents {
+				//comp := header.cComponents[cp]
+				var chann *[64]int
+				switch cp {
+				case 0:
+					chann = &(*block).ch1
+				case 1:
+					chann = &(*block).ch2
+				case 2:
+					chann = &(*block).ch3
+				default:
+					chann = nil
+				}
+				if chann == nil {
+					fmt.Printf("Error! chan = nil\n")
+					os.Exit(1)
+				}
+				dChan := [64]int{}
+				for y := 0; y < 8; y++ {
+					for x := 0; x < 8; x++ {
+						dChan[x+8*y] = inverseDCTPixel(x, y, chann)
+					}
+				}
+				*chann = dChan
+			}
+		}
+	}
+}
+
+// dequntize the coeffecients
+func dequantize(header *Header) {
+	for y := 0; y < header.blockHeightReal; y++ {
+		for x := 0; x < header.blockWidthReal; x++ {
+			blockIndex := x + y*header.blockWidthReal
+			block := &(*header.blocks)[blockIndex]
+			for cp := range header.cComponents {
+				var chann *[64]int
+				switch cp {
+				case 0:
+					chann = &(*block).ch1
+				case 1:
+					chann = &(*block).ch2
+				case 2:
+					chann = &(*block).ch3
+				default:
+					chann = nil
+				}
+				if chann == nil {
+					fmt.Printf("Error! chann = nil\n")
+					os.Exit(1)
+				}
+				tb := getQuantizationTable(header, cp)
+				for i := 0; i < 64; i++ {
+					(*chann)[i] *= int((*tb).table[i])
+				}
+			}
+		}
+	}
+}
+
+// YCbCr -> RGB
+func convertColorSpace(header *Header) {
+	for y := 0; y < header.blockHeightReal; y++ {
+		for x := 0; x < header.blockWidthReal; x++ {
+			block := &(*header.blocks)[x+y*header.blockWidthReal]
+			for a := 0; a < 64; a++ {
+				// YCbCr
+				Y := &(*block).ch1[a]
+				cb := &(*block).ch2[a]
+				cr := &(*block).ch3[a]
+				// RGB
+				r := float32((*Y)) + (1.402 * (float32(*cr))) + 128
+				g := float32((*Y)) - (0.344 * (float32(*cb))) - (0.714 * float32((*cr))) + 128
+				b := float32((*Y)) + (1.772 * (float32(*cb))) + 128
+				if r < 0 {
+					r = 0
+				}
+				if r > 255 {
+					r = 255
+				}
+				if b < 0 {
+					b = 0
+				}
+				if b > 255 {
+					b = 255
+				}
+				if g < 0 {
+					g = 0
+				}
+				if g > 255 {
+					g = 255
+				}
+				// set the 'rgb' values
+				*Y = int(r)
+				*cb = int(g)
+				*cr = int(b)
+			}
+		}
+	}
+}
+
+// spread coeffecient values
+func spreadCoeffecients(header *Header) {
+	yStep := header.cComponents[0].vSamplingFactor
+	xStep := header.cComponents[0].hSamplingFactor
+
+	for y := 0; y < header.blockHeight; y += yStep {
+		for x := 0; x < header.blockWidth; x += xStep {
+			// rBlock contains all the coeffecients that we need for the cb and cr
+			rBlock := (*header.blocks)[x+y*header.blockWidthReal]
+			for py := 0; py < 8*yStep; py += yStep {
+				yBlock := py / 8
+				for px := 0; px < 8*xStep; px += xStep {
+					xBlock := px / 8
+					// cBlock is the block where the coeffecient data is being writen to
+					cBlock := &(*header.blocks)[(x+xBlock)+(y+yBlock)*header.blockWidthReal]
+					// the index of the coeffecients that we are copying from the refference block
+					rYIndex := py / 2
+					rXIndex := px / 2
+					// the index of the coffecients that we are writing to
+					cYIndex := py
+					cXIndex := px
+					if cYIndex >= 8 {
+						cYIndex %= 8
+					}
+					if cXIndex >= 8 {
+						cXIndex %= 8
+					}
+					// set the values
+					for u := 0; u < yStep; u++ {
+						for v := 0; v < xStep; v++ {
+							(*cBlock).ch2[(cXIndex+v)+8*(cYIndex+u)] = rBlock.ch2[rXIndex+8*rYIndex]
+							(*cBlock).ch3[(cXIndex+v)+8*(cYIndex+u)] = rBlock.ch3[rXIndex+8*rYIndex]
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 func decodeHuffmanData(header *Header, br *BitReader) {
-	prevDC := [3]int{}
+	prevDC := [3]int{0, 0, 0}
 	skips := 0
 
 	luminanceOnlyScan := false
@@ -724,6 +872,11 @@ func decodeStartOfScan(header *Header) {
 			buf.advance()
 		}
 		if buf.bf[0] == EOI {
+			dequantize(header)
+			inverseDCT(header)
+			spreadCoeffecients(header)
+			convertColorSpace(header)
+			writeBitMap(header)
 			fmt.Printf("*** Reached the end-of-image marker\n")
 			break
 		}
@@ -836,14 +989,8 @@ func generateCodes(tb *HuffmanTable) {
 	}
 }
 
-/**
 func writeBitMap(header *Header) {
 	paddingSize := header.width % 4
-	// The total size
-	// 14 -> The first header
-	// 12 -> The second header
-	// the total number of (pixels * 3) bytes (1 byte per pixel)
-	// the total paddding bytes
 	size := 14 + 12 + (header.height * header.width * 3) + (paddingSize * header.height)
 	// Create the file
 	filename := path.Base(header.filename)
@@ -868,37 +1015,21 @@ func writeBitMap(header *Header) {
 	put2Int(uint(1), f)             // The number of planes as 2 bit integer
 	put2Int(uint(24), f)            // The number of bits per pixel as 2 bit integer
 
-	maxWidth := 0
-	maxHeight := 0
-	switch header.mcuDimensions {
-	case _8x8:
-		maxWidth = 8
-		maxHeight = 8
-	case _16x8:
-		maxWidth = 16
-		maxHeight = 8
-	case _8x16:
-		maxWidth = 8
-		maxHeight = 16
-	case _16x16:
-		maxWidth = 16
-		maxHeight = 16
-	}
-
 	for y := header.height - 1; y >= 0; y-- {
-		_mcuY := y % maxHeight
-		_mcuRow := y / maxHeight
+		blockRow := y / 8
+		pixelRow := y % 8
 		for x := 0; x < header.width; x++ {
-			_mcuX := x % maxWidth
-			_mcuColumn := x / maxWidth
-			_mcuIndex := _mcuColumn + header.mcuWidth*_mcuRow
-			_pixelIndex := _mcuX + maxWidth*_mcuY
-			// Write the RGB Values
-			rgb := []byte{}
-			rgb = append(rgb, byte((*header.MCUArray)[_mcuIndex].ch3[_pixelIndex]))
-			rgb = append(rgb, byte((*header.MCUArray)[_mcuIndex].ch2[_pixelIndex]))
-			rgb = append(rgb, byte((*header.MCUArray)[_mcuIndex].ch1[_pixelIndex]))
-			f.Write(rgb)
+			blockColumn := x / 8
+			pixelColumn := x % 8
+			blockIndex := blockColumn + blockRow*header.blockWidthReal
+			pixelIndex := pixelColumn + pixelRow*8
+			// write the 'rgb' values
+			block := (*header.blocks)[blockIndex]
+			rgbData := []byte{}
+			rgbData = append(rgbData, byte(block.ch3[pixelIndex]))
+			rgbData = append(rgbData, byte(block.ch2[pixelIndex]))
+			rgbData = append(rgbData, byte(block.ch1[pixelIndex]))
+			f.Write(rgbData)
 		}
 		padding := make([]byte, paddingSize)
 		f.Write(padding)
@@ -906,7 +1037,6 @@ func writeBitMap(header *Header) {
 	f.Close()
 }
 
-**/
 // Helper function to write a 4 byte integer in little endian
 func put4Int(a uint, f *os.File) {
 	data := make([]byte, 4)
