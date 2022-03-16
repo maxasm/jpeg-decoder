@@ -183,137 +183,228 @@ func decodeBandCoeffecients(header *Header, br *BitReader, acHuffmanTable *Huffm
 	// cmap for mapping coeffecients
 	var cmap map[int]int = zmap.Map1
 
-	// Progressive JPGs
-	if header.startOfSelection == 0 && header.successiveApproximationHigh == 0 {
-		/** DC First Visit **/
+	if header.frameType == SOF0 {
+		// Decode the DC coeffecient
 		sym := scanSymbol(br, dcHuffmanTable)
+		if sym == 0xFF {
+			fmt.Printf("Error! invalid DC Symbols\n")
+			os.Exit(1)
+		}
 		dcLength := int(sym)
-		dcCoeffecient := br.readBits(dcLength)
-		if dcLength != 0 && dcCoeffecient < (1<<(dcLength-1)) {
-			dcCoeffecient -= (1<<dcLength - 1)
+		// Since for DC length == sym
+		coeff := br.readBits(dcLength)
+		if dcLength != 0 && coeff < (1<<(dcLength-1)) {
+			coeff -= ((1 << dcLength) - 1)
 		}
-		dcCoeffecient += *prevDC
-		*prevDC = dcCoeffecient
-		(*channel)[cmap[0]] = dcCoeffecient << header.successiveApproximationLow
-	} else if header.startOfSelection != 0 && header.successiveApproximationHigh == 0 {
-		/** AC First Visit **/
-		if *skips > 0 {
-			*skips -= 1
-			return
-		}
-		// start at the start of selection of the band
-		start := int(header.startOfSelection)
-		end := int(header.endOfSelection)
-		index := start
+		coeff += *prevDC
+		*prevDC = coeff
+		(*channel)[0] = coeff
+		// Decode the AC Coeffecients
+		index := 1
 		for {
-			// end at the header end of selection
-			if index > end {
+			if index > 63 {
 				break
 			}
-			sym := scanSymbol(br, acHuffmanTable)
-			if sym == 0xff {
-				fmt.Printf("Error! Invalid symbol 0xff found\n")
-				os.Exit(1)
-			}
+			sym = scanSymbol(br, acHuffmanTable)
 			switch sym {
+			// The remaining coeffecients are all 0
+			case 0x00:
+				for a := index; a <= 63; a++ {
+					(*channel)[cmap[a]] = 0
+					index++
+				}
+			// The next 16 coeffecients are all 0
 			case 0xF0:
-				// 0xF0 means the next 16 coeffecients are 0
 				max := index + 16
 				for a := index; a < max; a++ {
 					(*channel)[cmap[a]] = 0
 					index++
 				}
+			// Decode the coeffLength and numZeros
 			default:
-				numZeros := int(sym >> 4)
-				acLength := int(sym & 0x0F)
-				if acLength != 0 {
-					max := index + numZeros
+				numZeros := sym >> 4
+				coeffLength := int(sym & 0x0F)
+				max := index + int(numZeros)
+				for a := index; a < max; a++ {
+					(*channel)[cmap[a]] = 0
+					index++
+				}
+				// read the coeffecient
+				coeff := br.readBits(int(coeffLength))
+				if coeff < (1 << (coeffLength - 1)) {
+					coeff -= ((1 << coeffLength) - 1)
+				}
+				(*channel)[cmap[index]] = coeff
+				index++
+			}
+		}
+	} else if header.frameType == SOF2 {
+		// Progressive JPGs
+		if header.startOfSelection == 0 && header.successiveApproximationHigh == 0 {
+			/** DC First Visit **/
+			sym := scanSymbol(br, dcHuffmanTable)
+			dcLength := int(sym)
+			dcCoeffecient := br.readBits(dcLength)
+			if dcLength != 0 && dcCoeffecient < (1<<(dcLength-1)) {
+				dcCoeffecient -= (1<<dcLength - 1)
+			}
+			dcCoeffecient += *prevDC
+			*prevDC = dcCoeffecient
+			(*channel)[cmap[0]] = dcCoeffecient << header.successiveApproximationLow
+		} else if header.startOfSelection != 0 && header.successiveApproximationHigh == 0 {
+			/** AC First Visit **/
+			if *skips > 0 {
+				*skips -= 1
+				return
+			}
+			// start at the start of selection of the band
+			start := int(header.startOfSelection)
+			end := int(header.endOfSelection)
+			index := start
+			for {
+				// end at the header end of selection
+				if index > end {
+					break
+				}
+				sym := scanSymbol(br, acHuffmanTable)
+				if sym == 0xff {
+					fmt.Printf("Error! Invalid symbol 0xff found\n")
+					os.Exit(1)
+				}
+				switch sym {
+				case 0xF0:
+					// 0xF0 means the next 16 coeffecients are 0
+					max := index + 16
 					for a := index; a < max; a++ {
 						(*channel)[cmap[a]] = 0
 						index++
 					}
-					acCoeffecient := br.readBits(acLength)
-					if acCoeffecient < (1 << (acLength - 1)) {
-						acCoeffecient -= (1<<acLength - 1)
+				default:
+					numZeros := int(sym >> 4)
+					acLength := int(sym & 0x0F)
+					if acLength != 0 {
+						max := index + numZeros
+						for a := index; a < max; a++ {
+							(*channel)[cmap[a]] = 0
+							index++
+						}
+						acCoeffecient := br.readBits(acLength)
+						if acCoeffecient < (1 << (acLength - 1)) {
+							acCoeffecient -= (1<<acLength - 1)
+						}
+						(*channel)[cmap[index]] = acCoeffecient << int(header.successiveApproximationLow)
+						index++
+					} else {
+						_skips := (1 << numZeros) - 1
+						_extra := br.readBits(numZeros)
+						if _extra == 0xff {
+							fmt.Printf("Error! Invalid EOB\n")
+							os.Exit(1)
+						}
+						_skips += _extra
+						*skips = _skips
+						// Once you have reached the end-of-band marker you should return &res
+						// this is because you are done with the current block
+						return
 					}
-					(*channel)[cmap[index]] = acCoeffecient << int(header.successiveApproximationLow)
-					index++
-				} else {
-					_skips := (1 << numZeros) - 1
-					_extra := br.readBits(numZeros)
-					if _extra == 0xff {
-						fmt.Printf("Error! Invalid EOB\n")
-						os.Exit(1)
-					}
-					_skips += _extra
-					*skips = _skips
-					// Once you have reached the end-of-band marker you should return &res
-					// this is because you are done with the current block
-					return
 				}
 			}
-		}
-	} else if header.startOfSelection == 0 && header.successiveApproximationHigh != 0 {
-		// For DC refinement all you need to do is read a single bit,
-		// shift it left by successiveApproximationHight, then bin-or it with the current DC coeffecient
-		bit := br.readBit()
-		if bit == 0xff {
-			fmt.Printf("Error! invalid DC refinment bit read\n")
-			os.Exit(1)
-		}
-		(*channel)[cmap[0]] |= bit << header.successiveApproximationLow
-	} else if header.startOfSelection != 0 && header.successiveApproximationHigh != 0 {
-		// negative and positie bits
-		positive := 1 << header.successiveApproximationLow
-		negative := -1 << header.successiveApproximationLow
-		index := int(header.startOfSelection)
+		} else if header.startOfSelection == 0 && header.successiveApproximationHigh != 0 {
+			// For DC refinement all you need to do is read a single bit,
+			// shift it left by successiveApproximationHight, then bin-or it with the current DC coeffecient
+			bit := br.readBit()
+			if bit == 0xff {
+				fmt.Printf("Error! invalid DC refinment bit read\n")
+				os.Exit(1)
+			}
+			(*channel)[cmap[0]] |= bit << header.successiveApproximationLow
+		} else if header.startOfSelection != 0 && header.successiveApproximationHigh != 0 {
+			// negative and positie bits
+			positive := 1 << header.successiveApproximationLow
+			negative := -1 << header.successiveApproximationLow
+			index := int(header.startOfSelection)
 
-		if *skips == 0 {
-			// Perform huffman-decoding, read a new bit for every non-zero coeffecient
-			for {
-				if index > int(header.endOfSelection) {
-					break
-				}
-				sym := scanSymbol(br, acHuffmanTable)
-				// check if the symbol is valid
-				if sym == 0xff {
-					fmt.Printf("Error! Invalid symbol 0xff\n")
-					os.Exit(1)
-				}
-				// get the number of zeroes and the coeffecient lenght
-				zeroes := sym >> 4
-				coeffLen := sym & 0x0f
-				// the coeffecient that will be set
-				coeff := 0
-
-				// coeffLen should be 1 because this is a refinment scan
-				if coeffLen != 0 {
-					if coeffLen != 1 {
-						fmt.Printf("Error! Invalid coeffLen expected %d but got %d\n", 1, coeffLen)
-						os.Exit(1)
-					}
-					bit := br.readBit()
-					if bit == 1 {
-						coeff = positive
-					} else if bit == 0 {
-						coeff = negative
-					} else {
-						fmt.Printf("Error\n")
-						os.Exit(1)
-					}
-				}
-
-				// check for end-of-band symbols
-				if coeffLen == 0 && sym != 0xf0 {
-					*skips = (1 << zeroes) + br.readBits(int(zeroes))
-					// fmt.Printf("eob -> %d\n", *skips)
-					break
-				}
-				// Handle the zeroes
+			if *skips == 0 {
+				// Perform huffman-decoding, read a new bit for every non-zero coeffecient
 				for {
+					if index > int(header.endOfSelection) {
+						break
+					}
+					sym := scanSymbol(br, acHuffmanTable)
+					// check if the symbol is valid
+					if sym == 0xff {
+						fmt.Printf("Error! Invalid symbol 0xff\n")
+						os.Exit(1)
+					}
+					// get the number of zeroes and the coeffecient lenght
+					zeroes := sym >> 4
+					coeffLen := sym & 0x0f
+					// the coeffecient that will be set
+					coeff := 0
+
+					// coeffLen should be 1 because this is a refinment scan
+					if coeffLen != 0 {
+						if coeffLen != 1 {
+							fmt.Printf("Error! Invalid coeffLen expected %d but got %d\n", 1, coeffLen)
+							os.Exit(1)
+						}
+						bit := br.readBit()
+						if bit == 1 {
+							coeff = positive
+						} else if bit == 0 {
+							coeff = negative
+						} else {
+							fmt.Printf("Error\n")
+							os.Exit(1)
+						}
+					}
+
+					// check for end-of-band symbols
+					if coeffLen == 0 && sym != 0xf0 {
+						*skips = (1 << zeroes) + br.readBits(int(zeroes))
+						// fmt.Printf("eob -> %d\n", *skips)
+						break
+					}
+					// Handle the zeroes
+					for {
+						var currCoeff *int
+						currCoeff = &((*channel)[cmap[index]])
+						// read a new bit for every non-zero coeffecient
+						if *currCoeff != 0 {
+							bit := br.readBit()
+							if bit == 1 {
+								if *currCoeff >= 0 {
+									*currCoeff += positive
+								} else {
+									*currCoeff += negative
+								}
+							} else if bit == 0 {
+								// do nothing
+							} else {
+								fmt.Printf("Error bit -> %d\n", bit)
+								os.Exit(1)
+							}
+						} else {
+							if zeroes == 0 {
+								break
+							}
+							zeroes -= 1
+						}
+						index += 1
+					}
+					(*channel)[cmap[index]] = coeff
+					index += 1
+				}
+			}
+
+			if *skips > 0 {
+				for {
+					if index > int(header.endOfSelection) {
+						break
+					}
 					var currCoeff *int
-					currCoeff = &((*channel)[cmap[index]])
-					// read a new bit for every non-zero coeffecient
+					currCoeff = &(*channel)[cmap[index]]
+					// read a new bit for every non-zero coeffeceint
 					if *currCoeff != 0 {
 						bit := br.readBit()
 						if bit == 1 {
@@ -325,48 +416,14 @@ func decodeBandCoeffecients(header *Header, br *BitReader, acHuffmanTable *Huffm
 						} else if bit == 0 {
 							// do nothing
 						} else {
-							fmt.Printf("Error bit -> %d\n", bit)
+							fmt.Printf("Error bit 2-> %d\n", bit)
 							os.Exit(1)
 						}
-					} else {
-						if zeroes == 0 {
-							break
-						}
-						zeroes -= 1
 					}
 					index += 1
 				}
-				(*channel)[cmap[index]] = coeff
-				index += 1
+				*skips -= 1
 			}
-		}
-
-		if *skips > 0 {
-			for {
-				if index > int(header.endOfSelection) {
-					break
-				}
-				var currCoeff *int
-				currCoeff = &(*channel)[cmap[index]]
-				// read a new bit for every non-zero coeffeceint
-				if *currCoeff != 0 {
-					bit := br.readBit()
-					if bit == 1 {
-						if *currCoeff >= 0 {
-							*currCoeff += positive
-						} else {
-							*currCoeff += negative
-						}
-					} else if bit == 0 {
-						// do nothing
-					} else {
-						fmt.Printf("Error bit 2-> %d\n", bit)
-						os.Exit(1)
-					}
-				}
-				index += 1
-			}
-			*skips -= 1
 		}
 	}
 }
