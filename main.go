@@ -451,30 +451,158 @@ func getQuantizationTable(header *Header, compIndex int) *QuantizationTable {
 	return nil
 }
 
-// Helper function to perform inverse DCT on 8x8 block
-func inverseDCTPixel(x int, y int, channel *[64]int) int {
-	sum := float64(0)
-	for u := 0; u < 8; u++ {
-		for v := 0; v < 8; v++ {
-			coeff := float64((*channel)[u+v*8])
-			cos1 := math.Cos((float64((2*x + 1)) * float64(u) * float64(math.Pi)) / 16)
-			cos2 := math.Cos((float64((2*y + 1)) * float64(v) * float64(math.Pi)) / 16)
-			if u == 0 {
-				if v == 0 {
-					sum += (float64(1) / float64(2)) * coeff * cos1 * cos2
-				} else {
-					sum += (float64(1) / math.Sqrt(2)) * coeff * cos1 * cos2
-				}
-			} else {
-				if v == 0 {
-					sum += (float64(1) / math.Sqrt(2)) * coeff * cos1 * cos2
-				} else {
-					sum += coeff * cos1 * cos2
-				}
-			}
-		}
+func inverseDCTOnComponent(chann *[64]int) {
+	// 1D IDCT on Columns
+	for i := 0; i < 8; i++ {
+		// g
+		var g0 float64 = float64((*chann)[i]) * S0
+		var g1 float64 = float64((*chann)[4*8+i]) * S4
+		var g2 float64 = float64((*chann)[2*8+i]) * S2
+		var g3 float64 = float64((*chann)[6*8+i]) * S6
+		var g4 float64 = float64((*chann)[5*8+i]) * S5
+		var g5 float64 = float64((*chann)[1*8+i]) * S1
+		var g6 float64 = float64((*chann)[7*8+i]) * S7
+		var g7 float64 = float64((*chann)[3*8+i]) * S3
+
+		// f
+		var f0 float64 = g0
+		var f1 float64 = g1
+		var f2 float64 = g2
+		var f3 float64 = g3
+		var f4 float64 = g4 - g7
+		var f5 float64 = g5 + g6
+		var f6 float64 = g5 - g6
+		var f7 float64 = g4 + g7
+
+		// e
+		var e0 float64 = f0
+		var e1 float64 = f1
+		var e2 float64 = f2 - f3
+		var e3 float64 = f2 + f3
+		var e4 float64 = f4
+		var e5 float64 = f5 - f7
+		var e6 float64 = f6
+		var e7 float64 = f5 + f7
+		var e8 float64 = f4 + f6
+
+		// d
+		var d0 float64 = e0
+		var d1 float64 = e1
+		var d2 float64 = e2 * M1
+		var d3 float64 = e3
+		var d4 float64 = e4 * M2
+		var d5 float64 = e5 * M3
+		var d6 float64 = e6 * M4
+		var d7 float64 = e7
+		var d8 float64 = e8 * M5
+
+		// c
+		var c0 float64 = d0 + d1
+		var c1 float64 = d0 - d1
+		var c2 float64 = d2 - d3
+		var c3 float64 = d3
+		var c4 float64 = d4 + d8
+		var c5 float64 = d5 + d7
+		var c6 float64 = d6 - d8
+		var c7 float64 = d7
+		var c8 float64 = c5 - c6
+
+		// b
+		var b0 float64 = c0 + c3
+		var b1 float64 = c1 + c2
+		var b2 float64 = c1 - c2
+		var b3 float64 = c0 - c3
+		var b4 float64 = c4 - c8
+		var b5 float64 = c8
+		var b6 float64 = c6 - c7
+		var b7 float64 = c7
+
+		// a -> final output
+		(*chann)[i] = int(b0 + b7)
+		(*chann)[1*8+i] = int(b1 + b6)
+		(*chann)[2*8+i] = int(b2 + b5)
+		(*chann)[3*8+i] = int(b3 + b4)
+		(*chann)[4*8+i] = int(b3 - b4)
+		(*chann)[5*8+i] = int(b2 - b5)
+		(*chann)[6*8+i] = int(b1 - b6)
+		(*chann)[7*8+i] = int(b0 - b7)
 	}
-	return int(sum * 0.25)
+
+	// 1D IDCT On Rows
+	for i := 0; i < 8; i++ {
+		// g
+		var g0 float64 = float64((*chann)[i*8+0]) * S0
+		var g1 float64 = float64((*chann)[i*8+4]) * S4
+		var g2 float64 = float64((*chann)[i*8+2]) * S2
+		var g3 float64 = float64((*chann)[i*8+6]) * S6
+		var g4 float64 = float64((*chann)[i*8+5]) * S5
+		var g5 float64 = float64((*chann)[i*8+1]) * S1
+		var g6 float64 = float64((*chann)[i*8+7]) * S7
+		var g7 float64 = float64((*chann)[i*8+3]) * S3
+
+		// f
+		var f0 float64 = g0
+		var f1 float64 = g1
+		var f2 float64 = g2
+		var f3 float64 = g3
+		var f4 float64 = g4 - g7
+		var f5 float64 = g5 + g6
+		var f6 float64 = g5 - g6
+		var f7 float64 = g4 + g7
+
+		// e
+		var e0 float64 = f0
+		var e1 float64 = f1
+		var e2 float64 = f2 - f3
+		var e3 float64 = f2 + f3
+		var e4 float64 = f4
+		var e5 float64 = f5 - f7
+		var e6 float64 = f6
+		var e7 float64 = f5 + f7
+		var e8 float64 = f4 + f6
+
+		// d
+		var d0 float64 = e0
+		var d1 float64 = e1
+		var d2 float64 = e2 * M1
+		var d3 float64 = e3
+		var d4 float64 = e4 * M2
+		var d5 float64 = e5 * M3
+		var d6 float64 = e6 * M4
+		var d7 float64 = e7
+		var d8 float64 = e8 * M5
+
+		// c
+		var c0 float64 = d0 + d1
+		var c1 float64 = d0 - d1
+		var c2 float64 = d2 - d3
+		var c3 float64 = d3
+		var c4 float64 = d4 + d8
+		var c5 float64 = d5 + d7
+		var c6 float64 = d6 - d8
+		var c7 float64 = d7
+		var c8 float64 = c5 - c6
+
+		// b
+		var b0 float64 = c0 + c3
+		var b1 float64 = c1 + c2
+		var b2 float64 = c1 - c2
+		var b3 float64 = c0 - c3
+		var b4 float64 = c4 - c8
+		var b5 float64 = c8
+		var b6 float64 = c6 - c7
+		var b7 float64 = c7
+
+		// a -> final output
+		(*chann)[i*8+0] = int(b0 + b7)
+		(*chann)[i*8+1] = int(b1 + b6)
+		(*chann)[i*8+2] = int(b2 + b5)
+		(*chann)[i*8+3] = int(b3 + b4)
+		(*chann)[i*8+4] = int(b3 - b4)
+		(*chann)[i*8+5] = int(b2 - b5)
+		(*chann)[i*8+6] = int(b1 - b6)
+		(*chann)[i*8+7] = int(b0 - b7)
+	}
 }
 
 // Inverse DCT
@@ -500,13 +628,7 @@ func inverseDCT(header *Header) {
 					fmt.Printf("Error! chan = nil\n")
 					os.Exit(1)
 				}
-				dChan := [64]int{}
-				for y := 0; y < 8; y++ {
-					for x := 0; x < 8; x++ {
-						dChan[x+8*y] = inverseDCTPixel(x, y, chann)
-					}
-				}
-				*chann = dChan
+				inverseDCTOnComponent(chann)
 			}
 		}
 	}
@@ -1050,6 +1172,7 @@ func writeBitMap(header *Header) {
 	paddingSize := header.width % 4
 	size := 14 + 12 + (header.height * header.width * 3) + (paddingSize * header.height)
 	// Create the file
+	//filename := header.filename
 	filename := path.Base(header.filename)
 	i := strings.LastIndex(filename, ".")
 	filename = filename[:i]
@@ -1211,6 +1334,24 @@ var zigzag = [64]byte{
 	58, 59, 52, 45, 38, 31, 39, 46,
 	53, 60, 61, 54, 47, 55, 62, 63,
 }
+
+// M-Factors
+var M0 float64 = 2.0 * math.Cos(1.0/16.0*2.0*math.Pi)
+var M1 float64 = 2.0 * math.Cos(2.0/16.0*2.0*math.Pi)
+var M3 float64 = 2.0 * math.Cos(2.0/16.0*2.0*math.Pi)
+var M5 float64 = 2.0 * math.Cos(3.0/16.0*2.0*math.Pi)
+var M2 float64 = M0 - M5
+var M4 float64 = M0 + M5
+
+// S-Factors
+var S0 float64 = math.Cos(0.0/16.0*math.Pi) / math.Sqrt(8)
+var S1 float64 = math.Cos(1.0/16.0*math.Pi) / 2.0
+var S2 float64 = math.Cos(2.0/16.0*math.Pi) / 2.0
+var S3 float64 = math.Cos(3.0/16.0*math.Pi) / 2.0
+var S4 float64 = math.Cos(4.0/16.0*math.Pi) / 2.0
+var S5 float64 = math.Cos(5.0/16.0*math.Pi) / 2.0
+var S6 float64 = math.Cos(6.0/16.0*math.Pi) / 2.0
+var S7 float64 = math.Cos(7.0/16.0*math.Pi) / 2.0
 
 // Markers
 const (
